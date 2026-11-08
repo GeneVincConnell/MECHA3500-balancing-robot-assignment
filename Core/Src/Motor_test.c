@@ -2,6 +2,10 @@
  * @file    Motor_test.c
  * @brief   Motor and LED test for the balancing robot.
  *
+ * PROVENANCE: AI-generated. Written by Claude (Anthropic), Nov 2026. It drives
+ * the TMC2240s through Analog Devices' TMC-API (TMC2240.c/.h, downloaded) and
+ * supplies the callbacks that library needs.
+ *
  * Put this file in Core/Src. Call Motor_test() once from main.c in
  * USER CODE BEGIN 2, after the MX_xxx_Init() calls. The timers then run in
  * hardware, so nothing needs to go in the while(1) loop.
@@ -51,8 +55,8 @@ void Motor_test(void)
 
 
         /* Step rate = 1 MHz / (ARR + 1) */
-        __HAL_TIM_SET_AUTORELOAD(&htim8, 45);   // STEP_L: 2 kHz, ~38 rpm
-        __HAL_TIM_SET_AUTORELOAD(&htim4, 45);   // STEP_R: 2 kHz, ~38 rpm
+        __HAL_TIM_SET_AUTORELOAD(&htim8, 60);   // STEP_L: 2 kHz, ~38 rpm
+        __HAL_TIM_SET_AUTORELOAD(&htim4, 60);   // STEP_R: 2 kHz, ~38 rpm
 
 
         /* Motors: 75 % duty on both STEP outputs, frequency as set in CubeMX.
@@ -81,45 +85,6 @@ void Motor_test(void)
 
 
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-}
-
-/* ========================================================================= */
-/* Live data print (SWV printf)                                              */
-/* ========================================================================= */
-/* printf -> SWV. syscalls.c's _write() sends each character here.
-   ITM_SendChar() (CMSIS) returns straight away when no debugger has enabled
-   ITM stimulus port 0, so this is safe without the debugger attached. */
-int __io_putchar(int ch)
-{
-    ITM_SendChar((uint32_t)ch);
-    return ch;
-}
-
-void Motor_PrintData(void)
-{
-    /* Sample DATA_PRINT_SAMPLES times, DATA_SAMPLE_MS apart, then print one
-       line (~0.1 s per line). The Data_Resync() first means a breakpoint or
-       pause since the last call cannot corrupt the first sample. */
-    Data_Resync();
-    Data_Update();                       /* fresh baseline after the last print */
-    for (uint32_t i = 0; i < DATA_PRINT_SAMPLES; i++) {
-        HAL_Delay(DATA_SAMPLE_MS);
-        Data_Update();
-    }
-
-    float   vel_L, vel_R, theta, theta_dot, theta_ddot;
-    int16_t ax, ay;
-    Data_GetMotorVelocity(&vel_L, &vel_R);
-    Data_GetTilt(&theta, &theta_dot, &theta_ddot);
-    Data_GetAccel(&ax, &ay, NULL);
-
-    printf("vel L %6.2f R %6.2f rad/s | theta %6.2f deg | ax %6d ay %6d | "
-           "theta_dot %7.1f deg/s | theta_ddot %8.1f deg/s^2\n",
-           vel_L, vel_R,
-           theta * RAD_TO_DEG,
-           ax, ay,
-           theta_dot * RAD_TO_DEG,
-           theta_ddot * RAD_TO_DEG);
 }
 
 /* ========================================================================= */

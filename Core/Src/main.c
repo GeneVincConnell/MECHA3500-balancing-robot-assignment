@@ -116,6 +116,7 @@ int main(void)
   MX_TIM5_Init();
   MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
+  /* The user code in this file was written with Claude (Anthropic, AI). */
 
 
 
@@ -127,6 +128,12 @@ int main(void)
   HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
 
+  /* Encoder.c: wheel positions and velocities in enc[] (Live Expressions),
+     updated every 1 ms by SysTick_Handler() in stm32f4xx_it.c once the flag
+     is set. 0.001 s = the SysTick period. */
+  Encoder_Init(0.001f);
+  encoder_tick_enabled = 1U;
+
   /* STEP PWM is configured but deliberately NOT started here:
        left  = TIM8 CH1 (PC6), right = TIM4 CH1 (PB6), 1 MHz tick, 5 us pulse.
        Step rate = 1 MHz / (ARR + 1); change it with __HAL_TIM_SET_AUTORELOAD().
@@ -137,29 +144,14 @@ int main(void)
   Motor_test();
   printf("SWV printf OK\n");
 
-  /* Sensors: encoders (already started above) and the MPU-6050.
-     Data_Init() measures the gyro bias for ~1 s: keep the robot still. */
+  /* MPU-6050: IMU_Init() (MPU6050.c glue code) measures the gyro bias for
+     ~1 s, so keep the robot still. If the sensor does not answer, the tests
+     in Claude_diagnostics.c run and print what they find. */
   printf("Keep the robot still: calibrating the gyro\n");
-  if (Data_Init()) {
-    printf("MPU-6050 OK, WHO_AM_I = 0x%02X, gyro x bias %.2f deg/s, start angle %.1f deg\n",
-           robot_data.imu_id, robot_data.gyro_bias_x, robot_data.theta * RAD_TO_DEG);
+  if (IMU_Init()) {
+    Data_PrintIMUStatus();
   } else {
-    /* ErrorCode: 0x04 = no acknowledge (wiring, power or address),
-       0x20 = timeout (bus stuck or missing pull-ups) */
-    printf("MPU-6050 not responding on I2C3: WHO_AM_I read 0x%02X, HAL error code 0x%02lX\n",
-           robot_data.imu_id, (unsigned long)hi2c3.ErrorCode);
-    Data_ScanI2C();
-    /* Pin levels read straight from the pins (works in I2C mode too).
-       An idle bus sits at 1 on both, held up by the GY-521 pull-ups. */
-    printf("I2C line levels: SDA (PC9) = %d, SCL (PA8) = %d  (idle bus = 1 and 1)\n",
-           (int)HAL_GPIO_ReadPin(IMU_SDA_GPIO_Port, IMU_SDA_Pin),
-           (int)HAL_GPIO_ReadPin(IMU_SCL_GPIO_Port, IMU_SCL_Pin));
-    /* Same pins as plain inputs with the STM32's weak pull-up and pull-down,
-       to tell a floating line from one held low */
-    Data_I2CPinTest();
-    /* Try the sensor on the STM32's internal pull-ups: answers = wiring OK but
-       the module's pull-ups are missing; no answer = open connection */
-    Data_I2CWeakPullupTest();
+    Diag_IMUNotResponding();
   }
 
 
@@ -173,7 +165,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    Motor_PrintData();   /* ~0.1 s of sampling, then one line to the console */
+    /* Sample the IMU every IMU_SAMPLE_MS, then print one line (~0.1 s per
+       line). The encoders update on their own at 1 kHz. */
+    for (uint32_t i = 0; i < DATA_PRINT_SAMPLES; i++) {
+      HAL_Delay(IMU_SAMPLE_MS);
+      IMU_Update();
+    }
+    Data_Print();
   }
   /* USER CODE END 3 */
 }

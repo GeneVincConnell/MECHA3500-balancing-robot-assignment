@@ -2,8 +2,22 @@
  * @file    Robot.h
  * @brief   Shared declarations for the balancing robot (NUCLEO-F446RE).
  *
- * Put this file in Core/Inc. Every variable and function used by the robot
- * code (Motor_test.c, ...) is declared here and defined in its .c file.
+ * PROVENANCE: AI-generated. Written by Claude (Anthropic), Nov 2026.
+ *
+ * Put this file in Core/Inc. The robot code's variables and functions are
+ * declared here and defined in their .c files:
+ *
+ *   File                  Written by                  Contents
+ *   Motor_test.c          Claude (AI)                 TMC2240 set-up, motor and LED test
+ *   data.c                Claude (AI)                 printing data to the console
+ *   Claude_diagnostics.c  Claude (AI)                 I2C / IMU hardware tests
+ *   MPU6050.c / .h        creative-apple (GitHub),    MPU-6050 library; the "AI generated
+ *                         + Claude glue section       glue code" section at the end of
+ *                                                     MPU6050.c is Claude's (IMU_...)
+ *   Encoder.c / .h        Claude (AI), algorithm      wheel encoders, PLL velocity
+ *                         from ODrive (MIT)           (declared in Encoder.h)
+ *   TMC2240.c / .h,       Analog Devices TMC-API      TMC2240 register access
+ *   TMC2240_HW_Abstraction.h  (GitHub)
  *
  * The TMC2240 drivers are run with Analog Devices' TMC-API library
  * (TMC2240.c in Core/Src, TMC2240.h + TMC2240_HW_Abstraction.h in Core/Inc,
@@ -29,7 +43,9 @@ extern "C" {
 
 #include "main.h"      /* HAL, pin labels from CubeMX */
 #include "TMC2240.h"   /* ADI TMC-API: tmc2240_readRegister, tmc2240_fieldWrite, ... */
-#include "MPU6050.h"   /* creative-apple MPU-6050 library (no include guard: include it only here) */
+#include "Encoder.h"   /* wheel encoders: enc[], Encoder_Init(), Encoder_Update() */
+/* MPU6050.h (creative-apple library) is NOT included here: it has no include
+   guard, so include it directly, once, in a .c file that calls the library. */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -128,7 +144,6 @@ extern uint32_t tmc_drv_status[TMC_COUNT];  /* DRV_STATUS: test with TMC2240_OLA
 /* Functions (defined in Motor_test.c)                                       */
 /* ========================================================================= */
 void     Motor_test(void);                       /* configure drivers, run motors, blink LED */
-void     Motor_PrintData(void);                  /* sample for ~0.1 s, then print one line   */
 uint8_t  Motor_DriverInit(uint16_t icID);        /* returns 1 if the driver is configured    */
 void     Motor_UpdateStatus(uint16_t icID);      /* refresh tmc_gstat / tmc_drv_status       */
 void     Motor_SetDuty(TIM_HandleTypeDef *htim, uint32_t channel, float duty);
@@ -137,14 +152,6 @@ void     Motor_Enable(void);                     /* TMC_EN low  -> power stages 
 void     Motor_Disable(void);                    /* TMC_EN high -> outputs floating */
 uint32_t TIM_APB1ClockHz(void);                  /* APB1 timer kernel clock, Hz     */
 
-/* printf output goes through SWV: ITM stimulus port 0 on the SWO pin (PB3)
-   to CubeIDE's "SWV ITM Data Console". Needs the ST-LINK GDB server with
-   Serial Wire Viewer enabled (core clock 84 MHz) and port 0 ticked in the
-   console's settings. It does not halt the CPU, and with no debugger or no
-   trace running printf simply returns, so the robot also runs untethered.
-   syscalls.c's _write() calls this once per character (defined in Motor_test.c). */
-int __io_putchar(int ch);
-
 /* Callbacks TMC-API calls to reach the hardware (also declared in TMC2240.h) */
 TMC2240BusType tmc2240_getBusType(uint16_t icID);
 void           tmc2240_readWriteSPI(uint16_t icID, uint8_t *data, size_t dataLength);
@@ -152,7 +159,8 @@ bool           tmc2240_readWriteUART(uint16_t icID, uint8_t *data, size_t writeL
 uint8_t        tmc2240_getNodeAddress(uint16_t icID);
 
 /* ========================================================================= */
-/* Sensors and state estimates (data.c)                                      */
+/* IMU: MPU-6050 tilt estimate                                               */
+/* Defined in MPU6050.c, in the "AI generated glue code" section (Claude).   */
 /* ========================================================================= */
 /* IMU (GY-521 / MPU-6050) mounting
      +x  towards motor_R
@@ -161,17 +169,17 @@ uint8_t        tmc2240_getNodeAddress(uint16_t icID);
    theta > 0 means the robot is leaning forwards (top towards +y). Check this
    sign against the theta convention in your MATLAB model.
 
-   How the tilt values are found (data.c):
+   How the tilt values are found (IMU_Update()):
      theta_dot   gyro rate about x, bias removed. Leaning forwards is a
                  negative rotation about +x (right-hand rule), so
                  GYRO_SIGN_X = -1.
      theta_ddot  derivative of the gyro rate, low-pass filtered.
      theta       gyro rate integrated. A gyro integral drifts, so the
                  accelerometer angle atan2(-ay, az) pulls it back slowly with
-                 time constant DATA_TILT_TAU_S (complementary filter). Set
-                 DATA_TILT_TAU_S to 0 for gyro only and expect slow drift.
+                 time constant IMU_TILT_TAU_S (complementary filter). Set
+                 IMU_TILT_TAU_S to 0 for gyro only and expect slow drift.
                  The starting angle always comes from the accelerometer.
-   The gyro bias is measured in Data_Init(): keep the robot still at start-up.
+   The gyro bias is measured in IMU_Init(): keep the robot still at start-up.
 
    Position: about 0.12 m above the ground, roughly in the centre of the
    0.14 m x 0.155 m body.
@@ -197,64 +205,21 @@ uint8_t        tmc2240_getNodeAddress(uint16_t icID);
 /* MPU-6050 settings come from the library's MPU6050_Initialization():
    gyro +/-250 deg/s (131 LSB per deg/s), accelerometer +/-2 g (16384 LSB/g),
    DLPF off, 200 Hz sample rate, I2C address 0x68. */
-#define GYRO_SIGN_X                (-1.0f)       /* theta_dot = -gyro x, see above */
-
-/* Encoders: x4 quadrature on a 1000 PPR encoder. The wheels face opposite
-   ways, so one side is negated to make "rolling forwards" positive on both.
-   Check by turning each wheel forwards by hand: both velocities should be
-   positive. If one is negative, flip its sign here.                         */
-#define ENC_COUNTS_PER_REV         4000.0f
-#define ENC_RAD_PER_COUNT          (2.0f * 3.14159265f / ENC_COUNTS_PER_REV)
-#define ENC_SIGN_L                 (+1)
-#define ENC_SIGN_R                 (-1)
+#define GYRO_SIGN_X                (-1.0f) /* theta_dot = -gyro x, see above   */
 
 /* Sampling and filtering */
-#define DATA_SAMPLE_MS             5U      /* Data_Update() period                    */
-#define DATA_PRINT_SAMPLES         20U     /* samples per Motor_PrintData() line       */
-#define DATA_DDOT_CUTOFF_HZ        10.0f   /* theta_ddot low-pass                      */
-
-/* Motor velocity: ODrive's phase-locked loop (PLL) on the encoder counts, see
-   Data_VelPLL() in data.c. Gains as in ODrive: kp = 2 x bandwidth,
-   ki = kp^2 / 4. ODrive needs period x kp < 1 to stay stable; Data_Update()
-   runs about every 6 ms (HAL_Delay(5) + the IMU read), so above ~75 rad/s
-   the correction step is capped at 0.9 / kp and this acts as a "how hard to
-   chase the counts" setting rather than a true bandwidth.
-   Tested on a PC with this Data_VelPLL() and this loop's timing (8 Nov 2026;
-   ramp to 20 rad/s, constant 20 rad/s, 2 Hz +/-1.5 rad/s wobble), RMS
-   velocity error in rad/s:
-                                   ramp   constant   wobble
-     old 10 Hz low-pass            0.19     0.024     0.25
-     PLL 100 (default)             0.18     0.026     0.23   about the same noise, a bit less lag
-     PLL 150                       0.12     0.053     0.15   less lag, 2x the noise
-     raw counts/dt (vel_raw_L/R)   0.11     0.113     0.12   no lag, 4x the noise
-   The old low-pass version is saved as data.c.bak-lpf / Robot.h.bak-lpf.    */
-#define DATA_VEL_PLL_BW_RAD_S      100.0f
-#define DATA_TILT_TAU_S            1.0f    /* accelerometer correction, s (0 = gyro only) */
-#define DATA_GYRO_CAL_SAMPLES      200U    /* x DATA_SAMPLE_MS: ~1 s gyro bias measurement */
-#define DATA_MAX_DT_S              0.1f    /* longer gap = treat as a halt             */
+#define IMU_SAMPLE_MS              5U      /* IMU_Update() period (main loop)          */
+#define IMU_DDOT_CUTOFF_HZ         10.0f   /* theta_ddot low-pass                      */
+#define IMU_TILT_TAU_S             1.0f    /* accelerometer correction, s (0 = gyro only) */
+#define IMU_GYRO_CAL_SAMPLES       200U    /* x IMU_SAMPLE_MS: ~1 s gyro bias measurement */
+#define IMU_MAX_DT_S               0.1f    /* longer gap = treat as a halt             */
 #define RAD_TO_DEG                 57.2957795f
 #define DEG_TO_RAD                 0.0174532925f
 
-/* State of one wheel's velocity PLL (data.c). The position estimate is
-   pos_int + pos_frac counts, split so it keeps full resolution however far
-   the robot drives (ODrive keeps it in one float). */
 typedef struct {
-    int32_t  pos_int;        /* whole counts of the position estimate         */
-    float    pos_frac;       /* fraction of a count, always in [0, 1)         */
-    float    vel;            /* velocity estimate, counts/s                   */
-} VelPLL;
-
-typedef struct {
-    /* Results (all "+ = forwards" for the wheels) */
-    int32_t  enc_L;          /* left encoder counts since Data_Init()         */
-    int32_t  enc_R;          /* right encoder counts since Data_Init()        */
-    float    vel_L;          /* left motor velocity, rad/s (PLL estimate)     */
-    float    vel_R;          /* right motor velocity, rad/s (PLL estimate)    */
-    float    vel_raw_L;      /* left, counts this sample / dt, rad/s (unfiltered, for comparison) */
-    float    vel_raw_R;      /* right, same                                   */
     int16_t  acc_raw[3];     /* accelerometer x, y, z, raw (16384 = 1 g)      */
     int16_t  gyro_raw[3];    /* gyro x, y, z, raw (131 = 1 deg/s)             */
-    float    gyro_bias_x;    /* gyro x bias from Data_Init(), deg/s           */
+    float    gyro_bias_x;    /* gyro x bias from IMU_Init(), deg/s            */
     float    theta;          /* tilt, rad, + = leaning forwards (gyro + slow accel correction) */
     float    theta_dot;      /* rad/s, from the gyro                          */
     float    theta_ddot;     /* rad/s^2, derivative of the gyro rate          */
@@ -262,32 +227,46 @@ typedef struct {
     float    dt;             /* last sample period, s                         */
     uint8_t  imu_ok;         /* 1 = MPU-6050 answered and was configured      */
     uint8_t  imu_id;         /* WHO_AM_I value (0x68 on a genuine MPU-6050)   */
-    /* Internal state used by Data_Update() */
+    /* Internal state used by IMU_Update() */
     uint8_t  timing_valid;
     uint32_t last_cycles;
-    uint32_t last_cnt_L;
-    uint16_t last_cnt_R;
-    VelPLL   pll_L;          /* velocity PLL state, left                      */
-    VelPLL   pll_R;          /* velocity PLL state, right                     */
-} RobotData;
+} IMU_Data;
 
-extern RobotData robot_data;  /* defined in data.c, handy in Live Expressions */
+extern IMU_Data imu_data;    /* defined in MPU6050.c; add it to Live Expressions */
 
-uint8_t  Data_Init(void);                        /* DWT counter, MPU-6050 setup, gyro bias; 1 = IMU OK */
-uint8_t  Data_InitIMU(void);                     /* WHO_AM_I check, then the library set-up      */
-void     Data_ScanI2C(void);                     /* print every address that answers on I2C3     */
-void     Data_I2CPinTest(void);                  /* read SDA/SCL with no pull, pull-up, pull-down */
-void     Data_I2CWeakPullupTest(void);           /* try the MPU-6050 at 50 kHz on internal pull-ups */
-uint8_t  Data_CalibrateGyro(void);              /* gyro bias + starting angle, robot still      */
-void     Data_Update(void);                      /* sample everything, call every DATA_SAMPLE_MS */
-void     Data_Resync(void);                      /* call after a printf or breakpoint halt       */
-float    Data_LowPassAlpha(float dt, float cutoff_hz);
-int32_t  Data_GetEncoderL(void);                 /* counts, + = forwards                         */
-int32_t  Data_GetEncoderR(void);
-void     Data_GetAccel(int16_t *ax, int16_t *ay, int16_t *az);           /* raw counts      */
-void     Data_GetGyro(int16_t *gx, int16_t *gy, int16_t *gz);            /* raw counts      */
-void     Data_GetMotorVelocity(float *vel_L, float *vel_R);              /* rad/s           */
-void     Data_GetTilt(float *theta, float *theta_dot, float *theta_ddot); /* rad, rad/s, rad/s^2 */
+uint8_t  IMU_Init(void);                 /* WHO_AM_I check, library set-up, gyro bias; 1 = OK */
+uint8_t  IMU_CalibrateGyro(void);        /* gyro bias + starting angle, robot still        */
+void     IMU_Update(void);               /* read the sensor, update the tilt estimate;
+                                            call every IMU_SAMPLE_MS                       */
+float    IMU_LowPassAlpha(float dt, float cutoff_hz);
+void     IMU_GetAccel(int16_t *ax, int16_t *ay, int16_t *az);            /* raw counts   */
+void     IMU_GetGyro(int16_t *gx, int16_t *gy, int16_t *gz);             /* raw counts   */
+void     IMU_GetTilt(float *theta, float *theta_dot, float *theta_ddot); /* rad, rad/s, rad/s^2 */
+
+/* ========================================================================= */
+/* Wheel encoders: everything is in Encoder.h / Encoder.c (included above)   */
+/* ========================================================================= */
+/* Set to 1 by main.c after Encoder_Init(0.001f). SysTick_Handler() in
+   stm32f4xx_it.c then calls Encoder_Update() every 1 ms. */
+extern volatile uint8_t encoder_tick_enabled;
+
+/* ========================================================================= */
+/* Console printing (data.c)                                                 */
+/* ========================================================================= */
+#define DATA_PRINT_SAMPLES         20U     /* IMU_Update() calls per printed line (~0.1 s) */
+
+int      __io_putchar(int ch);           /* printf -> SWV ITM port 0 (syscalls.c's _write) */
+void     Data_Print(void);               /* one line: wheel velocities, tilt, accel        */
+void     Data_PrintIMUStatus(void);      /* start-up report after IMU_Init() succeeds      */
+
+/* ========================================================================= */
+/* Diagnostics (Claude_diagnostics.c)                                        */
+/* ========================================================================= */
+void     Diag_IMUNotResponding(void);    /* report + all tests below; main.c calls it
+                                            when IMU_Init() fails                          */
+void     Diag_ScanI2C(void);             /* print every address that answers on I2C3       */
+void     Diag_I2CPinTest(void);          /* read SDA/SCL with no pull, pull-up, pull-down  */
+void     Diag_I2CWeakPullupTest(void);   /* try the MPU-6050 at 50 kHz on internal pull-ups */
 
 #ifdef __cplusplus
 }

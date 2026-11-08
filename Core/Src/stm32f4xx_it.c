@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "Encoder.h"   /* Encoder_Update(): AI-generated, see Encoder.h */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,7 +42,9 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-
+/* Set to 1 by main.c after Encoder_Init(), so Encoder_Update() never runs
+   before the encoder state is set up (declared in Robot.h). */
+volatile uint8_t encoder_tick_enabled = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -187,7 +190,13 @@ void SysTick_Handler(void)
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
-
+  /* Wheel encoders at a fixed 1 kHz (hook written by Claude, AI). SysTick is
+     the HAL time base, so this needs no extra timer in CubeMX. Encoder_Update()
+     only reads two timer registers and does a little float maths (~ a few us).
+     When the control loop gets its own fixed-rate timer, move this call there. */
+  if (encoder_tick_enabled) {
+    Encoder_Update();
+  }
   /* USER CODE END SysTick_IRQn 1 */
 }
 
