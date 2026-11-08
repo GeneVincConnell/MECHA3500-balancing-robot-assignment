@@ -135,6 +135,32 @@ int main(void)
 
 
   Motor_test();
+  printf("SWV printf OK\n");
+
+  /* Sensors: encoders (already started above) and the MPU-6050.
+     Data_Init() measures the gyro bias for ~1 s: keep the robot still. */
+  printf("Keep the robot still: calibrating the gyro\n");
+  if (Data_Init()) {
+    printf("MPU-6050 OK, WHO_AM_I = 0x%02X, gyro x bias %.2f deg/s, start angle %.1f deg\n",
+           robot_data.imu_id, robot_data.gyro_bias_x, robot_data.theta * RAD_TO_DEG);
+  } else {
+    /* ErrorCode: 0x04 = no acknowledge (wiring, power or address),
+       0x20 = timeout (bus stuck or missing pull-ups) */
+    printf("MPU-6050 not responding on I2C3: WHO_AM_I read 0x%02X, HAL error code 0x%02lX\n",
+           robot_data.imu_id, (unsigned long)hi2c3.ErrorCode);
+    Data_ScanI2C();
+    /* Pin levels read straight from the pins (works in I2C mode too).
+       An idle bus sits at 1 on both, held up by the GY-521 pull-ups. */
+    printf("I2C line levels: SDA (PC9) = %d, SCL (PA8) = %d  (idle bus = 1 and 1)\n",
+           (int)HAL_GPIO_ReadPin(IMU_SDA_GPIO_Port, IMU_SDA_Pin),
+           (int)HAL_GPIO_ReadPin(IMU_SCL_GPIO_Port, IMU_SCL_Pin));
+    /* Same pins as plain inputs with the STM32's weak pull-up and pull-down,
+       to tell a floating line from one held low */
+    Data_I2CPinTest();
+    /* Try the sensor on the STM32's internal pull-ups: answers = wiring OK but
+       the module's pull-ups are missing; no answer = open connection */
+    Data_I2CWeakPullupTest();
+  }
 
 
 
@@ -147,6 +173,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    Motor_PrintData();   /* ~0.1 s of sampling, then one line to the console */
   }
   /* USER CODE END 3 */
 }
