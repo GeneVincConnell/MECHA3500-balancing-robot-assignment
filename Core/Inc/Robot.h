@@ -202,9 +202,14 @@ uint8_t        tmc2240_getNodeAddress(uint16_t icID);
 #define BODY_SIZE_A_M              0.14f   /* body footprint 0.14 m x 0.155 m  */
 #define BODY_SIZE_B_M              0.155f
 
-/* MPU-6050 settings come from the library's MPU6050_Initialization():
-   gyro +/-250 deg/s (131 LSB per deg/s), accelerometer +/-2 g (16384 LSB/g),
-   DLPF off, 200 Hz sample rate, I2C address 0x68. */
+/* MPU-6050 settings: gyro +/-250 deg/s (131 LSB per deg/s), accelerometer
+   +/-2 g (16384 LSB/g), I2C address 0x68, from the library's
+   MPU6050_Initialization().
+   CHANGE (Claude, 9 Nov 2026): IMU_Init() then turns the chip's low-pass
+   filter on (gyro 42 Hz, accelerometer 44 Hz, ~5 ms delay) and sets the
+   output rate to 1 kHz. The library left the filter off at 200 Hz.
+   CHANGE (Claude, 9 Nov 2026): main.c now calibrates the gyro before
+   Motor_test() starts the motors, so the bias is measured without vibration. */
 #define GYRO_SIGN_X                (-1.0f) /* theta_dot = -gyro x, see above   */
 
 /* Sampling and filtering */

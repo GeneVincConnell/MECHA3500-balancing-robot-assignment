@@ -232,8 +232,9 @@ void MPU6050_ProcessData(Struct_MPU6050* mpu6050)
  *   IMU_Init()          Checks WHO_AM_I first, because the library's
  *                       MPU6050_Initialization() loops forever if the sensor
  *                       does not answer. Then runs the library set-up
- *                       (gyro +/-250 deg/s, accelerometer +/-2 g, DLPF off,
- *                       200 Hz) and IMU_CalibrateGyro().
+ *                       (gyro +/-250 deg/s, accelerometer +/-2 g), turns on
+ *                       the chip's low-pass filter (see CHANGE below) and
+ *                       runs IMU_CalibrateGyro().
  *   IMU_CalibrateGyro() Gyro bias and starting angle. Keep the robot still.
  *   IMU_Update()        Call every IMU_SAMPLE_MS. Reads the sensor and updates
  *                       the tilt estimate in imu_data (+ = leaning forwards):
@@ -275,6 +276,24 @@ uint8_t IMU_Init(void)
     }
 
     MPU6050_Initialization();             /* library set-up */
+
+    /* CHANGE (Claude, 9 Nov 2026): turn on the MPU-6050's digital low-pass
+       filter (DLPF). The library leaves it off, so every reading was a single
+       unfiltered sample with 256 Hz of bandwidth, and motor vibration at
+       hundreds of Hz aliased into the 200 Hz readings as fake tilt motion
+       (seen as ay swinging by 0.7 g and theta_dot by +/-50 deg/s with the
+       robot sitting still). The filter acts before sampling, so it removes
+       that vibration before it can alias; no filter after sampling can.
+         CONFIG     DLPF_CFG = 3: gyro 42 Hz, accelerometer 44 Hz,
+                    about 5 ms delay
+         SMPRT_DIV  0: data registers update at 1 kHz (with the DLPF on the
+                    gyro runs at 1 kHz, not 8 kHz), so every IMU_Update()
+                    gets a fresh filtered sample
+       These overwrite the library's CONFIG = 0x00 and SMPRT_DIV = 39. */
+    MPU6050_Writebyte(MPU6050_CONFIG,    0x03);
+    MPU6050_Writebyte(MPU6050_SMPRT_DIV, 0x00);
+    HAL_Delay(50);                        /* let the filter settle before calibrating */
+
     imu_data.imu_ok = IMU_CalibrateGyro();
     return imu_data.imu_ok;
 }

@@ -141,18 +141,24 @@ int main(void)
      configured over SPI2 and you drive TMC_EN low. */
 
 
-  Motor_test();
   printf("SWV printf OK\n");
 
   /* MPU-6050: IMU_Init() (MPU6050.c glue code) measures the gyro bias for
      ~1 s, so keep the robot still. If the sensor does not answer, the tests
-     in Claude_diagnostics.c run and print what they find. */
+     in Claude_diagnostics.c run and print what they find.
+     CHANGE (Claude, 9 Nov 2026): moved BEFORE Motor_test(). It used to run
+     after the motors had started, so the gyro bias was measured while the
+     robot was vibrating (9.49 deg/s). Here the drivers are still disabled
+     (TMC_EN boots high), so the motors are off during the calibration. */
   printf("Keep the robot still: calibrating the gyro\n");
   if (IMU_Init()) {
     Data_PrintIMUStatus();
   } else {
     Diag_IMUNotResponding();
   }
+
+  /* Configure the TMC2240s and start the motors, after the gyro calibration */
+  Motor_test();
 
 
 
