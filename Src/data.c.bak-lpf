@@ -1,0 +1,361 @@
+/**
+ * @file    data.c
+ * @brief   Sensor readings and state estimates for the balancing robot.
+ *
+ * Put this file in Core/Src. Declarations, settings and the IMU mounting
+ * notes are in Robot.h.
+ *
+ *   Encoders  TIM5 (left, 32-bit) and TIM3 (right, 16-bit), x4 = 4000 counts/rev
+ *   IMU       MPU-6050 (GY-521) on I2C3, address 0x68, read with the
+ *             creative-apple STM32-MPU6050 library (MPU6050.c / MPU6050.h):
+ *             gyro +/-250 deg/s, accelerometer +/-2 g, DLPF off, 200 Hz
+ *
+ * Tilt (theta, + = leaning forwards):
+ *   theta_dot   straight from the gyro (rate about x, bias removed)
+ *   theta_ddot  derivative of the gyro rate, low-pass filtered
+ *   theta       gyro rate integrated, with a slow pull towards the
+ *               accelerometer angle to stop it drifting (complementary
+ *               filter, time constant DATA_TILT_TAU_S; 0 = gyro only)
+ *
+ * How to use:
+ *   1. Call Data_Init() once, after the MX_xxx_Init() calls and after the
+ *      encoder timers are started. Keep the robot still: it measures the
+ *      gyro bias for about 1 s and takes the starting angle from the
+ *      accelerometer.
+ *   2. Call Data_Update() at a steady rate (every DATA_SAMPLE_MS).
+ *   3. Read the results with the Data_Get...() functions, or watch
+ *      robot_data in Live Expressions.
+ *
+ * Timing uses the Cortex-M4 DWT cycle counter (84 MHz). A breakpoint (or
+ * pausing in the debugger) halts the CPU while the wheels and the robot keep
+ * moving, so call Data_Resync() after one. The rotation during the halt is
+ * missed by the gyro integral; the accelerometer correction removes that
+ * error over a few DATA_TILT_TAU_S.
+ *
+ * NOTE: the wheels are not attached yet and the accelerometer position in
+ * Robot.h (IMU_HEIGHT_ABOVE_GROUND_M etc.) is a rough figure. A more precise
+ * position relative to the wheel axle is still to be worked out; see the
+ * IMU section in Robot.h for why it matters.
+ */
+#include "Robot.h"
+#include <math.h>
+#include <string.h>
+
+/* ------------------------------------------------------------------------- */
+/* Variable declared in Robot.h                                              */
+/* ------------------------------------------------------------------------- */
+RobotData robot_data;
+
+/* ========================================================================= */
+/* Setup                                                                     */
+/* ========================================================================= */
+uint8_t Data_Init(void)
+{
+    memset(&robot_data, 0, sizeof(robot_data));
+
+    /* Start the DWT cycle counter, used to measure dt between samples */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+
+    /* Encoder counts are measured from here */
+    robot_data.last_cnt_L = __HAL_TIM_GET_COUNTER(&htim5);
+    robot_data.last_cnt_R = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+
+    robot_data.imu_ok = Data_InitIMU();
+    return robot_data.imu_ok;
+}
+
+uint8_t Data_InitIMU(void)
+{
+    /* Ask for WHO_AM_I with the library's own read function first. The
+       library's MPU6050_Initialization() loops forever if the sensor does not
+       answer, so only call it once the sensor has replied with 0x68. */
+    robot_data.imu_id = 0U;
+    MPU6050_Readbyte(MPU6050_WHO_AM_I, &robot_data.imu_id);
+    if (robot_data.imu_id != 0x68U) {
+        return 0U;
+    }
+
+    /* Library set-up: reset, wake, 200 Hz sample rate, DLPF off,
+       gyro +/-250 deg/s, accelerometer +/-2 g */
+    MPU6050_Initialization();
+
+    return Data_CalibrateGyro();
+}
+
+uint8_t Data_CalibrateGyro(void)
+{
+    /* Average the gyro x rate with the robot still: that average is the bias.
+       Average the accelerometer too, for the starting angle. */
+    float sum_gx = 0.0f, sum_ay = 0.0f, sum_az = 0.0f;
+
+    for (uint32_t i = 0; i < DATA_GYRO_CAL_SAMPLES; i++) {
+        MPU6050_ProcessData(&MPU6050);          /* library: read and convert */
+        sum_gx += MPU6050.gyro_x;               /* deg/s */
+        sum_ay += MPU6050.acc_y;                /* g     */
+        sum_az += MPU6050.acc_z;                /* g     */
+        HAL_Delay(DATA_SAMPLE_MS);
+    }
+
+    robot_data.gyro_bias_x = sum_gx / (float)DATA_GYRO_CAL_SAMPLES;
+    robot_data.theta_acc   = atan2f(-sum_ay, sum_az);
+    robot_data.theta       = robot_data.theta_acc;
+    return 1U;
+}
+
+void Data_ScanI2C(void)
+{
+    /* Print every 7-bit address on I2C3 that acknowledges. The MPU-6050
+       should answer at 0x68 (0x69 if its AD0 pin is high). */
+    uint32_t found = 0;
+    printf("I2C3 scan:");
+    for (uint16_t addr = 0x08U; addr <= 0x77U; addr++) {
+        if (HAL_I2C_IsDeviceReady(&hi2c3, (uint16_t)(addr << 1), 2U, 5U) == HAL_OK) {
+            printf(" 0x%02X", (unsigned)addr);
+            found++;
+        }
+    }
+    printf(found ? "\n" : " nothing answered\n");
+}
+
+void Data_I2CPinTest(void)
+{
+    /* Take PA8 (SCL) and PC9 (SDA) away from I2C3 and read them as plain
+       inputs three ways: no pull, the STM32's internal pull-up (~40 kOhm)
+       and its internal pull-down (~40 kOhm). The weak internal resistors
+       only win if nothing else is driving the line:
+         pull-down reads 1          -> something holds the line high (healthy:
+                                       the GY-521's pull-up is there)
+         pull-up 1, pull-down 0     -> floating: nothing connected to the pin
+         pull-up reads 0            -> something holds the line low (short to
+                                       GND, or an unpowered/faulty device)    */
+    static const uint32_t     pulls[3] = { GPIO_NOPULL, GPIO_PULLUP, GPIO_PULLDOWN };
+    static const char * const names[3] = { "no pull  ", "pull-up  ", "pull-down" };
+    GPIO_PinState sda[3], scl[3];
+    GPIO_InitTypeDef g = {0};
+
+    HAL_I2C_DeInit(&hi2c3);                  /* releases PA8 and PC9 */
+
+    g.Mode  = GPIO_MODE_INPUT;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    for (uint32_t i = 0; i < 3U; i++) {
+        g.Pull = pulls[i];
+        g.Pin  = IMU_SDA_Pin;
+        HAL_GPIO_Init(IMU_SDA_GPIO_Port, &g);
+        g.Pin  = IMU_SCL_Pin;
+        HAL_GPIO_Init(IMU_SCL_GPIO_Port, &g);
+        HAL_Delay(2);                        /* let the line settle */
+        sda[i] = HAL_GPIO_ReadPin(IMU_SDA_GPIO_Port, IMU_SDA_Pin);
+        scl[i] = HAL_GPIO_ReadPin(IMU_SCL_GPIO_Port, IMU_SCL_Pin);
+        printf("I2C pin test, %s: SDA (PC9) = %d, SCL (PA8) = %d\n",
+               names[i], (int)sda[i], (int)scl[i]);
+    }
+
+    const GPIO_PinState *lines[2] = { sda, scl };
+    static const char * const line_names[2] = { "SDA (PC9)", "SCL (PA8)" };
+    for (uint32_t k = 0; k < 2U; k++) {
+        const GPIO_PinState *v = lines[k];
+        const char *verdict;
+        if (v[2] == GPIO_PIN_SET) {
+            verdict = "held HIGH by a pull-up: the line and the GY-521 pull-up are fine";
+        } else if (v[1] == GPIO_PIN_SET) {
+            verdict = "FLOATING: nothing is connected to this pin (open joint or missing pull-up)";
+        } else {
+            verdict = "held LOW: shorted to GND, or pulled down by an unpowered or faulty device";
+        }
+        printf("  %s: %s\n", line_names[k], verdict);
+    }
+
+    HAL_I2C_Init(&hi2c3);                    /* back to I2C (calls HAL_I2C_MspInit) */
+}
+
+void Data_I2CWeakPullupTest(void)
+{
+    /* Try the MPU-6050 with the STM32's own weak pull-ups (~40 kOhm) on SDA and
+       SCL and I2C slowed to 50 kHz (weak pull-ups give slow rising edges).
+         answers   -> the wiring is connected; the GY-521's pull-ups are missing
+         no answer -> the connection between the STM32 and the MPU-6050 is open
+                      (or the chip is dead)
+       Afterwards I2C3 goes back to its CubeMX settings (400 kHz, no pull-ups). */
+    I2C_InitTypeDef saved = hi2c3.Init;
+    GPIO_InitTypeDef g = {0};
+    uint8_t who = 0U;
+
+    HAL_I2C_DeInit(&hi2c3);
+    hi2c3.Init.ClockSpeed = 50000U;
+    HAL_I2C_Init(&hi2c3);                    /* pins back to I2C, no pull */
+
+    g.Mode      = GPIO_MODE_AF_OD;
+    g.Pull      = GPIO_PULLUP;               /* the STM32's internal pull-ups */
+    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Alternate = GPIO_AF4_I2C3;
+    g.Pin       = IMU_SDA_Pin;
+    HAL_GPIO_Init(IMU_SDA_GPIO_Port, &g);
+    g.Pin       = IMU_SCL_Pin;
+    HAL_GPIO_Init(IMU_SCL_GPIO_Port, &g);
+    HAL_Delay(2);
+
+    /* Reset the peripheral now the lines are high, so it starts with the bus
+       idle instead of "busy" from when the lines were floating low */
+    hi2c3.Instance->CR1 |=  I2C_CR1_SWRST;
+    hi2c3.Instance->CR1 &= ~I2C_CR1_SWRST;
+    HAL_I2C_Init(&hi2c3);                    /* already initialised: keeps the pull-ups */
+
+    printf("Weak pull-up test (50 kHz): line levels SDA = %d, SCL = %d\n",
+           (int)HAL_GPIO_ReadPin(IMU_SDA_GPIO_Port, IMU_SDA_Pin),
+           (int)HAL_GPIO_ReadPin(IMU_SCL_GPIO_Port, IMU_SCL_Pin));
+
+    /* Try both MPU-6050 addresses: 0x68 with AD0 low, 0x69 with AD0 high.
+       AD0 is not connected on the PCB (U2 pad 7), so on a GY-521 without its
+       usual AD0 pull-down resistor the address is not fixed. */
+    static const uint8_t addrs[2] = { 0x68U, 0x69U };
+    HAL_StatusTypeDef st = HAL_ERROR;
+    uint8_t addr = 0U;
+    for (uint32_t i = 0; i < 2U && st != HAL_OK; i++) {
+        who = 0U;
+        st = HAL_I2C_Mem_Read(&hi2c3, (uint16_t)(addrs[i] << 1), MPU6050_WHO_AM_I,
+                              I2C_MEMADD_SIZE_8BIT, &who, 1U, 10U);
+        if (st == HAL_OK) addr = addrs[i];
+    }
+    if (st == HAL_OK && addr == 0x68U) {
+        printf("  MPU-6050 ANSWERED at 0x68 (WHO_AM_I 0x%02X): the wiring is connected but the\n"
+               "  GY-521 has no working pull-ups. Fit 4.7 kOhm from SDA and from SCL to 3.3 V.\n",
+               (unsigned)who);
+    } else if (st == HAL_OK) {
+        printf("  MPU-6050 ANSWERED at 0x69 (WHO_AM_I 0x%02X): the wiring is connected, but AD0\n"
+               "  is high or floating and the module's resistors are missing. Fit 4.7 kOhm from\n"
+               "  SDA and SCL to 3.3 V, and tie AD0 (U2 pad 7) to GND (or use address 0x69).\n",
+               (unsigned)who);
+    } else {
+        printf("  No answer at 0x68 or 0x69 even with pull-ups (HAL error code 0x%02lX): the\n"
+               "  connection between the STM32 and the MPU-6050 is open (joint, header pin),\n"
+               "  or the chip is dead.\n", (unsigned long)hi2c3.ErrorCode);
+    }
+    printf("  With pull-ups, ");
+    Data_ScanI2C();                          /* anything else on the bus? */
+
+    HAL_I2C_DeInit(&hi2c3);                  /* back to the CubeMX settings */
+    hi2c3.Init = saved;
+    HAL_I2C_Init(&hi2c3);
+}
+
+/* ========================================================================= */
+/* Update: call every DATA_SAMPLE_MS                                         */
+/* ========================================================================= */
+void Data_Update(void)
+{
+    RobotData *d = &robot_data;
+
+    uint32_t now   = DWT->CYCCNT;
+    uint32_t cnt_L = __HAL_TIM_GET_COUNTER(&htim5);
+    uint16_t cnt_R = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+
+    /* Encoder counts. Always accumulated, even across a halt, so the wheel
+       position never loses counts. TIM3 is 16-bit: the int16_t cast handles
+       the wrap as long as Data_Update runs at least every few seconds. */
+    int32_t dL = (int32_t)(cnt_L - d->last_cnt_L) * ENC_SIGN_L;
+    int32_t dR = (int32_t)(int16_t)(uint16_t)(cnt_R - d->last_cnt_R) * ENC_SIGN_R;
+    d->last_cnt_L = cnt_L;
+    d->last_cnt_R = cnt_R;
+    d->enc_L += dL;
+    d->enc_R += dR;
+
+    /* IMU, read with the library: gyro rate (theta_dot) and accelerometer
+       angle (drift reference) */
+    float rate = d->theta_dot;
+    if (d->imu_ok) {
+        MPU6050_ProcessData(&MPU6050);        /* raw values, then g and deg/s */
+        d->acc_raw[0]  = MPU6050.acc_x_raw;
+        d->acc_raw[1]  = MPU6050.acc_y_raw;
+        d->acc_raw[2]  = MPU6050.acc_z_raw;
+        d->gyro_raw[0] = MPU6050.gyro_x_raw;
+        d->gyro_raw[1] = MPU6050.gyro_y_raw;
+        d->gyro_raw[2] = MPU6050.gyro_z_raw;
+        rate = GYRO_SIGN_X * (MPU6050.gyro_x - d->gyro_bias_x) * DEG_TO_RAD;
+        d->theta_acc = atan2f(-MPU6050.acc_y, MPU6050.acc_z);
+    }
+
+    float dt = (float)(now - d->last_cycles) / (float)SystemCoreClock;
+    d->last_cycles = now;
+
+    if (!d->timing_valid || dt <= 0.0f || dt > DATA_MAX_DT_S) {
+        /* First sample, or after Data_Resync(): no integration or
+           differentiation across the gap. theta keeps its last value. */
+        d->theta_dot = rate;
+        d->timing_valid = 1U;
+        return;
+    }
+    d->dt = dt;
+
+    /* Motor velocity from the encoders, rad/s, low-pass filtered */
+    float a_vel = Data_LowPassAlpha(dt, DATA_VEL_CUTOFF_HZ);
+    d->vel_L += a_vel * ((float)dL * ENC_RAD_PER_COUNT / dt - d->vel_L);
+    d->vel_R += a_vel * ((float)dR * ENC_RAD_PER_COUNT / dt - d->vel_R);
+
+    /* theta_ddot: derivative of the gyro rate, low-pass filtered */
+    float a_dd = Data_LowPassAlpha(dt, DATA_DDOT_CUTOFF_HZ);
+    float rate_prev = d->theta_dot;
+    d->theta_ddot += a_dd * ((rate - rate_prev) / dt - d->theta_ddot);
+    d->theta_dot   = rate;
+
+    /* theta: integrate the gyro (trapezoidal), then pull slowly towards the
+       accelerometer angle so gyro bias drift cannot build up */
+    float theta_gyro = d->theta + 0.5f * (rate + rate_prev) * dt;
+    float k = (DATA_TILT_TAU_S > 0.0f) ? dt / (DATA_TILT_TAU_S + dt) : 0.0f;
+    d->theta = theta_gyro + k * (d->theta_acc - theta_gyro);
+}
+
+void Data_Resync(void)
+{
+    /* The next Data_Update() takes a fresh baseline instead of a sample
+       that spans the halt. Encoder counts and theta are kept. */
+    robot_data.timing_valid = 0U;
+}
+
+float Data_LowPassAlpha(float dt, float cutoff_hz)
+{
+    /* First-order low-pass: y += alpha * (x - y), alpha = dt / (tau + dt) */
+    float tau = 1.0f / (2.0f * 3.14159265f * cutoff_hz);
+    return dt / (tau + dt);
+}
+
+/* ========================================================================= */
+/* Getters: values from the latest Data_Update(). Any pointer may be NULL.   */
+/* ========================================================================= */
+int32_t Data_GetEncoderL(void)
+{
+    return robot_data.enc_L;
+}
+
+int32_t Data_GetEncoderR(void)
+{
+    return robot_data.enc_R;
+}
+
+void Data_GetAccel(int16_t *ax, int16_t *ay, int16_t *az)
+{
+    if (ax) *ax = robot_data.acc_raw[0];
+    if (ay) *ay = robot_data.acc_raw[1];
+    if (az) *az = robot_data.acc_raw[2];
+}
+
+void Data_GetGyro(int16_t *gx, int16_t *gy, int16_t *gz)
+{
+    if (gx) *gx = robot_data.gyro_raw[0];
+    if (gy) *gy = robot_data.gyro_raw[1];
+    if (gz) *gz = robot_data.gyro_raw[2];
+}
+
+void Data_GetMotorVelocity(float *vel_L, float *vel_R)
+{
+    if (vel_L) *vel_L = robot_data.vel_L;
+    if (vel_R) *vel_R = robot_data.vel_R;
+}
+
+void Data_GetTilt(float *theta, float *theta_dot, float *theta_ddot)
+{
+    if (theta)      *theta      = robot_data.theta;
+    if (theta_dot)  *theta_dot  = robot_data.theta_dot;
+    if (theta_ddot) *theta_ddot = robot_data.theta_ddot;
+}
