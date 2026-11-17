@@ -41,6 +41,19 @@ void Data_Print(void)
 /* Start-up report after IMU_Init() succeeds */
 void Data_PrintIMUStatus(void)
 {
-    printf("MPU-6050 OK, WHO_AM_I = 0x%02X, gyro x bias %.2f deg/s, start angle %.1f deg\n",
-           imu_data.imu_id, imu_data.gyro_bias_x, imu_data.theta * RAD_TO_DEG);
+    /* The library prints "LSB_Sensitivity_GYRO: 131" during its set-up;
+       IMU_Init() changes the range afterwards, so this line is the real one */
+    printf("MPU-6050 OK, WHO_AM_I = 0x%02X, gyro %.1f LSB per deg/s, x bias %.2f deg/s, "
+           "start angle %.1f deg\n",
+           imu_data.imu_id, imu_data.gyro_lsb_per_dps, imu_data.gyro_bias_x,
+           imu_data.theta * RAD_TO_DEG);
+}
+
+/* Start-up report if IMU_Init() fails: the sensor did not answer with 0x68.
+   HAL error code 0x04 = no acknowledge (wiring, power or address),
+   0x20 = timeout (bus stuck or missing pull-ups). */
+void Data_PrintIMUError(void)
+{
+    printf("MPU-6050 not responding on I2C3: WHO_AM_I read 0x%02X, HAL error code 0x%02lX\n",
+           imu_data.imu_id, (unsigned long)hi2c3.ErrorCode);
 }

@@ -233,10 +233,13 @@ void MPU6050_ProcessData(Struct_MPU6050* mpu6050)
  *                       MPU6050_Initialization() loops forever if the sensor
  *                       does not answer. Then runs the library set-up
  *                       (gyro +/-250 deg/s, accelerometer +/-2 g), turns on
- *                       the chip's low-pass filter (see CHANGE below) and
- *                       runs IMU_CalibrateGyro().
+ *                       the chip's low-pass filter and sets the gyro range to
+ *                       IMU_GYRO_FS_SEL (+/-1000 deg/s) (see the CHANGEs
+ *                       below), and runs IMU_CalibrateGyro().
  *   IMU_CalibrateGyro() Gyro bias and starting angle. Keep the robot still.
- *   IMU_Update()        Call every IMU_SAMPLE_MS. Reads the sensor and updates
+ *   IMU_WaitForNextSample()  Main loop: waits until the next IMU_SAMPLE_US
+ *                       tick (500 Hz), measured with the DWT cycle counter.
+ *   IMU_Update()        Call every IMU_SAMPLE_US. Reads the sensor and updates
  *                       the tilt estimate in imu_data (+ = leaning forwards):
  *     theta_dot   gyro rate about x, bias removed
  *     theta_ddot  derivative of the gyro rate, low-pass filtered
@@ -292,30 +295,109 @@ uint8_t IMU_Init(void)
        These overwrite the library's CONFIG = 0x00 and SMPRT_DIV = 39. */
     MPU6050_Writebyte(MPU6050_CONFIG,    0x03);
     MPU6050_Writebyte(MPU6050_SMPRT_DIV, 0x00);
+
+    /* CHANGE (Claude, 14 Nov 2026): gyro range IMU_GYRO_FS_SEL (+/-1000 deg/s,
+       reason in Robot.h). GYRO_CONFIG bits 4:3 = FS_SEL. The library's own
+       MPU6050_Get_LSB_Sensitivity() is then told the new range, so its
+       MPU6050_DataConvert() keeps giving deg/s (the accelerometer stays at
+       range 0, +/-2 g, as the library set it). Read back to check. */
+    static const float gyro_lsb_per_dps[4] = { 131.0f, 65.5f, 32.8f, 16.4f };
+    uint8_t gyro_config = 0U;
+    MPU6050_Writebyte(MPU6050_GYRO_CONFIG, (uint8_t)(IMU_GYRO_FS_SEL << 3));
+    MPU6050_Readbyte(MPU6050_GYRO_CONFIG, &gyro_config);
+    if (((gyro_config >> 3) & 0x03U) != IMU_GYRO_FS_SEL) {
+        imu_data.imu_ok = 0U;
+        return 0U;
+    }
+    MPU6050_Get_LSB_Sensitivity(IMU_GYRO_FS_SEL, 0U);
+    imu_data.gyro_lsb_per_dps = gyro_lsb_per_dps[IMU_GYRO_FS_SEL];
     HAL_Delay(50);                        /* let the filter settle before calibrating */
 
     imu_data.imu_ok = IMU_CalibrateGyro();
     return imu_data.imu_ok;
 }
 
+/* CHANGE (Claude, 14 Nov 2026): one library read, with a check that it
+   worked. The library ignores HAL_I2C_Mem_Read()'s result, and a failed read
+   leaves its 14-byte buffer partly unwritten, so a single bad read would put
+   a garbage spike in the data. HAL clears hi2c3.ErrorCode at the start of
+   each transfer and sets it on a timeout or missing acknowledge; a transfer
+   refused because the bus was busy leaves the state not READY.
+   Returns 1 if MPU6050 now holds a fresh, good reading. */
+static uint8_t imu_read(void)
+{
+    MPU6050_ProcessData(&MPU6050);        /* library: raw values, then g and deg/s */
+    if ((hi2c3.ErrorCode != HAL_I2C_ERROR_NONE) || (hi2c3.State != HAL_I2C_STATE_READY)) {
+        imu_data.i2c_errors++;
+        return 0U;
+    }
+    return 1U;
+}
+
 uint8_t IMU_CalibrateGyro(void)
 {
     /* Average the gyro x rate with the robot still: that average is the bias.
-       Average the accelerometer too, for the starting angle. */
-    float sum_gx = 0.0f, sum_ay = 0.0f, sum_az = 0.0f;
+       Average the accelerometer too, for the starting angle. Failed reads
+       are left out of the averages. */
+    float    sum_gx = 0.0f, sum_ay = 0.0f, sum_az = 0.0f;
+    uint32_t n = 0U;
 
     for (uint32_t i = 0; i < IMU_GYRO_CAL_SAMPLES; i++) {
-        MPU6050_ProcessData(&MPU6050);    /* library: read and convert */
-        sum_gx += MPU6050.gyro_x;         /* deg/s */
-        sum_ay += MPU6050.acc_y;          /* g     */
-        sum_az += MPU6050.acc_z;          /* g     */
+        if (imu_read()) {
+            sum_gx += MPU6050.gyro_x;     /* deg/s */
+            sum_ay += MPU6050.acc_y;      /* g     */
+            sum_az += MPU6050.acc_z;      /* g     */
+            n++;
+        }
         HAL_Delay(IMU_SAMPLE_MS);
     }
+    if (n < (IMU_GYRO_CAL_SAMPLES / 2U)) {
+        return 0U;                        /* most reads failed: no usable bias */
+    }
 
-    imu_data.gyro_bias_x = sum_gx / (float)IMU_GYRO_CAL_SAMPLES;
+    imu_data.gyro_bias_x = sum_gx / (float)n;
     imu_data.theta_acc   = atan2f(-sum_ay, sum_az);
     imu_data.theta       = imu_data.theta_acc;
     return 1U;
+}
+
+/* Main loop pacing (added by Claude, 14 Nov 2026). Waits until the next
+   IMU_SAMPLE_US tick on the DWT cycle counter. The schedule advances by
+   exactly one period each call, so the rate does not drift with the loop's
+   own run time. If a pass ran more than a whole period late (the gyro
+   calibration, a breakpoint, a slow printf) the schedule restarts from now
+   instead of firing a burst of back-to-back samples to catch up, and
+   missed_periods counts it. The real sample times are still measured
+   (IMU_Update() dt, SensorLog's time column). */
+void IMU_WaitForNextSample(void)
+{
+    static uint32_t next_cycles = 0U;
+    static uint8_t  started     = 0U;
+
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U) {
+        /* IMU_Init() starts the counter; if it has not run, start it here,
+           or CYCCNT would stay at 0 and the wait below would never end */
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+        DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
+    }
+
+    const uint32_t period = (SystemCoreClock / 1000000U) * IMU_SAMPLE_US;
+    uint32_t now = DWT->CYCCNT;
+
+    if (!started) {
+        started     = 1U;
+        next_cycles = now + period;
+        return;
+    }
+    if ((int32_t)(now - next_cycles) > (int32_t)period) {
+        imu_data.missed_periods++;
+        next_cycles = now + period;
+        return;
+    }
+    while ((int32_t)(DWT->CYCCNT - next_cycles) < 0) {
+        /* wait; SysTick (encoders) and USART2 interrupts still run */
+    }
+    next_cycles += period;
 }
 
 void IMU_Update(void)
@@ -323,10 +405,10 @@ void IMU_Update(void)
     IMU_Data *d = &imu_data;
     uint32_t now = DWT->CYCCNT;
 
-    /* Gyro rate (theta_dot) and accelerometer angle (drift reference) */
+    /* Gyro rate (theta_dot) and accelerometer angle (drift reference).
+       After a failed read the last good values are kept. */
     float rate = d->theta_dot;
-    if (d->imu_ok) {
-        MPU6050_ProcessData(&MPU6050);    /* library: raw values, then g and deg/s */
+    if (d->imu_ok && imu_read()) {
         d->acc_raw[0]  = MPU6050.acc_x_raw;
         d->acc_raw[1]  = MPU6050.acc_y_raw;
         d->acc_raw[2]  = MPU6050.acc_z_raw;
@@ -367,26 +449,4 @@ float IMU_LowPassAlpha(float dt, float cutoff_hz)
     /* First-order low-pass: y += alpha * (x - y), alpha = dt / (tau + dt) */
     float tau = 1.0f / (2.0f * 3.14159265f * cutoff_hz);
     return dt / (tau + dt);
-}
-
-/* Values from the latest IMU_Update(). Any pointer may be NULL. */
-void IMU_GetAccel(int16_t *ax, int16_t *ay, int16_t *az)
-{
-    if (ax) *ax = imu_data.acc_raw[0];
-    if (ay) *ay = imu_data.acc_raw[1];
-    if (az) *az = imu_data.acc_raw[2];
-}
-
-void IMU_GetGyro(int16_t *gx, int16_t *gy, int16_t *gz)
-{
-    if (gx) *gx = imu_data.gyro_raw[0];
-    if (gy) *gy = imu_data.gyro_raw[1];
-    if (gz) *gz = imu_data.gyro_raw[2];
-}
-
-void IMU_GetTilt(float *theta, float *theta_dot, float *theta_ddot)
-{
-    if (theta)      *theta      = imu_data.theta;
-    if (theta_dot)  *theta_dot  = imu_data.theta_dot;
-    if (theta_ddot) *theta_ddot = imu_data.theta_ddot;
 }

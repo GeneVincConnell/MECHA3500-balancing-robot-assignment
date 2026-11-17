@@ -1,0 +1,7 @@
+﻿-IC:\Users\61404\Downloads\Robot_matlab
+-IC:\Users\61404\Downloads\Robot_matlab\Subsystem1_ert_rtw
+-I"C:\Program Files\MATLAB\R2026b\extern\include"
+-I"C:\Program Files\MATLAB\R2026b\simulink\include"
+-I"C:\Program Files\MATLAB\R2026b\rtw\c\src"
+-I"C:\Program Files\MATLAB\R2026b\rtw\c\src\ext_mode\common"
+-I"C:\Program Files\MATLAB\R2026b\rtw\c\ert"

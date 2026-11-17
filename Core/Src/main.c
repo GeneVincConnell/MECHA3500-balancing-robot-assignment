@@ -22,8 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "Robot.h"
-#include "TMC2240.h"
-#include "TMC2240_HW_Abstraction.h"
+#include "SensorLog.h"
+#include "Balance_AIgen.h"  /* AI-GENERATED (Claude, 2026-11-17) */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -118,34 +118,30 @@ int main(void)
   /* USER CODE BEGIN 2 */
   /* The user code in this file was written with Claude (Anthropic, AI). */
 
-
+  /* Serial on the ST-LINK COM port (Lab5.c, the course toolchain's uart.c /
+     cmd_parser.c adapted for CubeIDE): USART2 interrupts, "Hello World!",
+     then the TIM6 tick for Lab 5's logPot / logEnc. Everything that uses the
+     COM port (SensorLog too) goes through Lab5.c, so this comes first.
+     CHANGE (Claude, 17 Nov 2026): added; SensorLog no longer has its own
+     USART2 driver. */
+  Lab5_Init();
+  logging_init();
 
   /* LD2 heartbeat: TIM2 CH1 hardware PWM, 0.5 s period (0.25 s on / 0.25 s off) */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 
-  /* Wheel encoders, x4 quadrature (4000 counts/rev)
-     TIM5 = left wheel (32-bit), TIM3 = right wheel (16-bit: use (int16_t)(now - last)) */
-  HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
-  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
-
-  /* Encoder.c: wheel positions and velocities in enc[] (Live Expressions),
-     updated every 1 ms by SysTick_Handler() in stm32f4xx_it.c once the flag
-     is set. 0.001 s = the SysTick period. */
+  /* Wheel encoders (Encoder.c): Encoder_Init() starts TIM5 (left) and TIM3
+     (right) in x4 quadrature mode, 4000 counts/rev. Positions and velocities
+     are in enc[] (Live Expressions), updated every 1 ms by SysTick_Handler()
+     in stm32f4xx_it.c once the flag is set. 0.001 s = the SysTick period. */
   Encoder_Init(0.001f);
   encoder_tick_enabled = 1U;
-
-  /* STEP PWM is configured but deliberately NOT started here:
-       left  = TIM8 CH1 (PC6), right = TIM4 CH1 (PB6), 1 MHz tick, 5 us pulse.
-       Step rate = 1 MHz / (ARR + 1); change it with __HAL_TIM_SET_AUTORELOAD().
-     TMC_EN (PB5) boots HIGH, so both drivers stay disabled until they are
-     configured over SPI2 and you drive TMC_EN low. */
-
 
   printf("SWV printf OK\n");
 
   /* MPU-6050: IMU_Init() (MPU6050.c glue code) measures the gyro bias for
-     ~1 s, so keep the robot still. If the sensor does not answer, the tests
-     in Claude_diagnostics.c run and print what they find.
+     ~1 s, so keep the robot still. If the sensor does not answer, one line
+     with the error code is printed and the tilt values stay at 0.
      CHANGE (Claude, 9 Nov 2026): moved BEFORE Motor_test(). It used to run
      after the motors had started, so the gyro bias was measured while the
      robot was vibrating (9.49 deg/s). Here the drivers are still disabled
@@ -154,14 +150,31 @@ int main(void)
   if (IMU_Init()) {
     Data_PrintIMUStatus();
   } else {
-    Diag_IMUNotResponding();
+    Data_PrintIMUError();
   }
 
-  /* Configure the TMC2240s and start the motors, after the gyro calibration */
-  Motor_test();
+  /* Encoder + IMU logger on the ST-LINK COM port (SensorLog.c, written by
+     Claude, AI). Its commands come through Lab5.c's command line; MATLAB's
+     logRobotSensors.m sends
+       "logAll [seconds]"            stop the motor PWM, recalibrate the
+                                     gyro, record, send the data as CSV
+       "logFall [pre] [post] [deg]"  motors held, recalibrate, wait for the
+                                     robot to fall, send the fall as CSV */
+  SensorLog_Init();
 
+  /* >>> AI-GENERATED START (Claude, 2026-11-17): start the balance controller */
+  /* Balance_AIgen.c runs the MATLAB-generated controller (Subsystem1, in
+     MATLAB_firmware_subsystem). This sets up both TMC2240s (battery on) and
+     arms it: hold the robot upright and still for 0.5 s and it starts
+     balancing. The blue button B1 or "bal off" stops, B1 or "bal on"
+     re-arms. Details and the sign checks are in Balance_AIgen.h. */
+  Balance_Start();
+  /* <<< AI-GENERATED END */
 
+  /* Configure the TMC2240s and start the motors, after the gyro calibration.
+     TMC_EN (PB5) boots HIGH, so the drivers stay off until Motor_test(). */
 
+  //Motor_test();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -171,13 +184,34 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* Sample the IMU every IMU_SAMPLE_MS, then print one line (~0.1 s per
-       line). The encoders update on their own at 1 kHz. */
+    /* Sample the IMU at a fixed 500 Hz, then print one line (0.1 s per
+       line). The encoders update on their own at 1 kHz.
+       CHANGE (Claude, 14 Nov 2026): IMU_WaitForNextSample() (MPU6050.c)
+       replaces HAL_Delay(5), which gave 5-6 ms per sample plus a ~7 ms gap
+       at every printed line; and no line is printed while SensorLog is
+       recording or sending, so a log has no gaps. */
     for (uint32_t i = 0; i < DATA_PRINT_SAMPLES; i++) {
-      HAL_Delay(IMU_SAMPLE_MS);
+      IMU_WaitForNextSample();
       IMU_Update();
+      /* >>> AI-GENERATED START (Claude, 2026-11-17): balance controller step */
+      /* Straight after IMU_Update(), so the controller sees this sample's tilt */
+      Balance_Update();
+      /* <<< AI-GENERATED END */
+      SensorLog_Update();
+      /* Serial commands and Lab 5 log output (Lab5.c). Not while SensorLog
+         is recording or sending, so nothing lands in the middle of its CSV;
+         commands typed meanwhile wait in the RX buffer.
+         CHANGE (Claude, 17 Nov 2026): added with the move to Lab5.c. */
+      if (!SensorLog_Busy()) {
+        Lab5_Process();
+      }
     }
-    Data_Print();
+    /* CHANGE (Claude, 17 Nov 2026): no line while the balance controller
+       drives the motors either. Data_Print()'s float printf (and SWV) can
+       take a large part of a 2 ms period; use "bal stream" instead. */
+    if (!SensorLog_Busy() && !Balance_Active()) {
+      Data_Print();
+    }
   }
   /* USER CODE END 3 */
 }
