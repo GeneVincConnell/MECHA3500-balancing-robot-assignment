@@ -1,0 +1,238 @@
+%% robotLQG_setup_AIgen.m
+% AI-GENERATED (Claude, 2026-11-14; updated 2026-11-15: measured-parameter
+% overrides, Jc from the rig pole, stepper limits computed by
+% stepperLimits_AIgen instead of typed in)
+% Written by Claude (Anthropic) for Gene Connell's MCHA3500 balancing robot.
+%
+% Parameters and controller design for robotLQG_sim.slx (built by
+% build_robotLQG_sim_AIgen.m). The model runs this script itself before each
+% simulation (PreLoadFcn / InitFcn), so edit the numbers here. Re-measured
+% robot parameters go in the "Robot parameters" section at the top.
+%
+% Adapted from the EV3 Gyroboy LQG controller with integral action
+% (LQG_IA_NPC: model.m and controller_lqg_ia.m), which designs an LQR with an
+% integrator on the wheel angle (lqrd) plus a steady-state Kalman filter
+% (kalmd) whose state is fed to the gain, at Ts = 2 ms:
+%   https://github.com/jakubk28/LegoMindstormsEV3/blob/1d4c2ae5f93b4aafa8b2fe3e427c627b9f0127fe/LQG_IA_NPC/controller_lqg_ia.m
+%   Copyright (c) 2019, Timothy Hughes. BSD licence (LICENSE.md in that repo).
+% Nothing is copied: the plant, states, input, sensors and every number are
+% this robot's. What is kept is the design recipe (same functions, same
+% structure); everything EV3-specific (DC-motor model, PWM input, yaw,
+% gyro drift calibration, keyboard/UDP) is gone.
+%
+% Plant: flow-source model, state x = [phi; theta; ptheta], input
+% omega = dphi (stepper speed relative to the chassis), measured outputs
+% y = [phi (encoders); theta (IMU tilt estimate); dtheta (gyro)].
+%
+% Toolboxes: Control System Toolbox (ss, lqrd, kalmd), Simulink.
+%
+% For MPC later: replace the Control subsystem with an MPC Controller block
+% built from the same discrete model, with the stepper limits as constraints
+% on the manipulated variable (see the "MPC" section at the end).
+
+%% Timing
+Ts = 0.002;                        % control period: the firmware's 500 Hz loop [s]
+
+
+%====================================================================================================================================================================%
+%% Robot parameters: edit here when you re-measure
+% Start from the estimates in classBalancingRobotFlowLinear_AIgen (masses you
+% measured, datasheets, mass layout). Put a re-measured value here; NaN keeps
+% the estimate. Everything after this section (the plant, the stepper limits,
+% the LQR and Kalman gains) is recomputed from these numbers every time the
+% Simulink model runs, so nothing else needs changing.
+meas.mc     = NaN;                 % robot without wheels [kg]           (estimate 2.1088)
+meas.l      = NaN;                 % axle to chassis CoM [m]             (estimate 0.0544)
+meas.r      = NaN;                 % wheel radius [m]                    (estimate 0.052)
+meas.mWheel = NaN;                 % one wheel including hub [kg]        (estimate 0.138)
+lambdaRig   = 7.60;                % unstable pole from the rig falls [1/s]
+                                   % (fitRigFall_AIgen, 14 Nov 2026); gives Jc
+                                   % for the current mc and l. NaN = layout estimate
+
+robot = classBalancingRobotFlowLinear_AIgen();
+est   = classBalancingRobotFlowLinear_AIgen.estimatedParameters();
+if ~isnan(meas.mc), robot.mc = meas.mc; end
+if ~isnan(meas.l),  robot.l  = meas.l;  end
+if ~isnan(meas.r),  robot.r  = meas.r;  end
+mWheel = est.mw/2;
+if ~isnan(meas.mWheel), mWheel = meas.mWheel; end
+robot.mw = 2*mWheel;
+robot.Jw = 2*(0.5*mWheel*robot.r^2) + est.Jr;     % both wheels as discs + both rotors
+if ~isnan(lambdaRig)
+    % Rig fall: lambda^2 = mc*g*l/(Jr + Jc + mc*l^2)  ->  solve for Jc
+    robot.Jc = robot.mc*robot.g*robot.l/lambdaRig^2 - robot.mc*robot.l^2 - est.Jr;
+end
+% Parameter vector for robotFlowPlant_AIgen (order matters)
+p = [robot.mc; robot.Jc; robot.mw; robot.Jw; robot.l; robot.r; robot.g; robot.b_theta];
+%====================================================================================================================================================================%
+
+
+
+%====================================================================================================================================================================%
+%% Linear model about upright, y = [phi; theta; dtheta]
+A = robot.A();
+B = robot.B();
+C = robot.C_meas();                % dtheta = A0*ptheta - B0*omega,
+D = robot.D_meas();                % so D is not zero
+%====================================================================================================================================================================%
+
+
+
+
+%====================================================================================================================================================================%
+%stepper motor dynamics and limit calculations done here
+%% Steppers: speed and acceleration limits (Assignment 2, Task 1.1)
+% Computed from the robot parameters above and the pull-out curve below by
+% stepperLimits_AIgen: the largest box |omega| <= omegaMax, |alpha| <= alphaMax
+% (largest A_p) inside the speeds and accelerations the motors can sustain.
+% Pull-out curve of one 17HS24-2004D-E1K, read off StepperOnline's
+% 17HS24-2004D-E1K_Torque_Curve.pdf (24 V, 2.0 A, 2000 microsteps/rev):
+
+%motor curves taken from datasheets
+motor.wCurve   = [17.5 35 70 105 140 175 210 245 280 315 350 385 420 455 490 525]*2*pi/60;   % [rad/s]
+motor.tauCurve = [49.0 48.2 48.4 48.1 48.1 39.3 31.7 31.6 31.6 24.7 24.8 18.7 18.7 18.7 13.7 13.7]/100; % [N m]
+
+
+motor.Vcurve   = 24;               % supply voltage of the curve [V]
+motor.Icurve   = 2.0;              % phase current of the curve [A]
+motor.curveIsRms = true;           % stepper ratings are usually RMS (StepperOnline: match
+                                   % the motor rating to the driver's RMS setting)
+motor.Vbatt    = 22.2;             % 6S LiPo, nominal [V] (use 21 for a nearly flat pack)
+tmcIRUN        = 23;               % TMC_IRUN in Robot.h (0-31)
+tmcIfs         = 2.0;              % full-scale peak current: CURRENT_RANGE 1, RREF 12 kOhm [A]
+motor.IrunPeak = (tmcIRUN + 1)/32*tmcIfs;   % 1.5 A peak
+motor.SF       = 1.5;              % torque safety factor: 1 = right on the pull-out curve
+                                   % (Assignment 2's metric); 1.5-2 is the usual stepper rule
+motor.omegaMaxUser = NaN;          % NaN = box with the largest A_p; or set a speed limit
+                                   % [rad/s] to trade top speed for acceleration
+lim = stepperLimits_AIgen(robot, motor);
+omegaMax = lim.omegaMax;           % wheel speed limit [rad/s]
+alphaMax = lim.alphaMax;           % wheel acceleration limit [rad/s^2]
+tauAvail = lim.tauAvail;           % torque per motor alphaMax needs, = pull-out/SF [N m]
+                                   % (run_robotLQG_sim_AIgen checks against the full curve)
+%====================================================================================================================================================================%
+
+                                   
+                                   
+                                   
+%====================================================================================================================================================================%                                   
+%% Sensors (the IMU and encoders as the firmware sees them)
+sensorNonIdeal = 1;                % 1 = rounds based on the sensors quantisation, 0 to turn off
+encRes    = 2*pi/4000;             % encoder: 4000 counts/rev [rad]
+gyroRes   = (pi/180)/32.8;         % MPU-6050 gyro at +/-1000 deg/s [rad/s per LSB]
+
+
+%these values set the Sd of the noise
+%currently 0.2 for default assumed noise, noise hasn't been measured yet
+sigTheta  = 0.2*pi/180;            % noise on the firmware tilt estimate [rad] 
+sigGyro   = 0.2*pi/180;            % gyro noise including motor vibration [rad/s]
+
+
+thetaBias = 1.5*pi/180;            % tilt reading at balance (accelerometer offset,
+                                   % CoM fore/aft); the rig fit found about -1.5 deg [rad]
+
+                                   
+% Values the Sensors subsystem uses
+encQ          = max(sensorNonIdeal*encRes,  eps);      %these consider the maximum resolution of the gyro and encoders
+gyroQ         = max(sensorNonIdeal*gyroRes, eps);      %this effects the bandwidth that the noise affects, outside of this bandwith the noise is filtered
+thetaNoiseVar = sensorNonIdeal*sigTheta^2;             %by quantisation
+gyroNoiseVar  = sensorNonIdeal*sigGyro^2;
+thetaBiasUsed = sensorNonIdeal*thetaBias;
+%====================================================================================================================================================================%
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+%% Test scenario
+x0             = [0; 5*pi/180; 0]; % start leaning 5 deg forwards, at rest (ptheta = 0)
+xhat0          = [0; x0(2) + thetaBiasUsed; 0];  % firmware starts its tilt from the
+                                   % accelerometer reading (offset included)
+phiRefStepTime = 3;                % then drive one wheel turn forwards [s]
+phiRefStep     = 2*pi;             % [rad] (= 0.33 m with r = 5.2 cm), ramped at phiRefRate
+Tstop          = 9;                % simulation length [s]
+
+%% LQR with integral action, designed on the stepper acceleration
+% The steppers cannot change speed instantly: above alphaMax they run out of
+% torque and miss steps. So the controller's input is the wheel acceleration
+% a = d(omega)/dt, and omega becomes a state that the controller integrates
+% itself (clamped to the speed and acceleration limits). R then penalises
+% acceleration directly, which is what loads the motors. (An LQR on omega
+% alone asks for ~25 rad/s the instant it sees a 5 deg lean and falls once
+% the acceleration limit cuts in.) This part is new; Gyroboy's DC motors
+% take a voltage and do not need it.
+%
+% Integral action as in Lab 8 classDiscreteLQRcontrol.controlInit_integrator
+% and Gyroboy's controller_lqg_ia.m: z = integral of (phi - phi_ref).
+% Integrating phi rather than theta matters: with an offset in the tilt
+% reading, an integrator on theta would hold the robot off balance and it
+% would run away; on phi it just holds its spot.
+Aw = [A, B; zeros(1, 4)];          % state [phi; theta; ptheta; omega]
+Bw = [0; 0; 0; 1];                 % input: wheel acceleration [rad/s^2]
+Cr = [1 0 0 0];
+Ai = [Aw, zeros(4, 1); Cr, 0];     % state [phi; theta; ptheta; omega; z]
+Bi = [Bw; 0];
+% Bryson's rule: weight each state by 1/(largest acceptable value)^2
+phiTol    = 0.5;                   % wheel angle [rad]
+thetaTol  = 3*pi/180;              % tilt [rad]
+dthetaTol = 1.0;                   % tilt rate [rad/s], as momentum below
+pthetaTol = dthetaTol/robot.Acoef();
+omegaTol  = 10;                    % wheel speed [rad/s]
+zTol      = 0.5;                   % integral of phi error [rad s]
+alphaTol  = 0.5*alphaMax;          % wheel acceleration [rad/s^2], half of alphaMax
+Q = diag(1./[phiTol, thetaTol, pthetaTol, omegaTol, zTol].^2);
+R = 1/alphaTol^2;
+K  = lqrd(Ai, Bi, Q, R, Ts);       % a = -K*[x - x_ref; omega; z]
+Kx = K(1:3);
+Kw = K(4);
+Kz = K(5);
+zLimit = 0.5*alphaMax/abs(Kz);     % anti-windup: the integral alone can ask for at
+                                   % most half the acceleration limit
+phiRefRate = 2;                    % reference speed for moves [rad/s] (0.1 m/s)
+
+%% Kalman filter (steady state, discrete)
+% Process noise enters as a wheel-speed error (through B, as Gyroboy does)
+% and as a disturbance torque on ptheta. kalmd discretises it for Ts.
+G = [B, [0; 0; 1]];
+sigOmegaProc = 0.2;                % wheel speed error per step [rad/s]
+sigTauProc   = 0.02;               % disturbance torque per step [N m]
+Qn = diag([sigOmegaProc^2, sigTauProc^2])*Ts;
+Rn = diag([encRes^2/12, sigTheta^2, sigGyro^2])*Ts;   % kalmd uses Rn/Ts
+kest = kalmd(ss(A, [B, G], C, [D, zeros(3, 2)]), Qn, Rn, Ts);
+% kest: inputs [omega; y], state = predicted estimate xhat[k|k-1]. The model
+% uses its state directly (as Gyroboy's estimator does), so there is no
+% algebraic loop through the D term.
+
+%% Checks
+sysd = c2d(ss(Ai, Bi, eye(5), 0), Ts);
+clPoles  = eig(sysd.A - sysd.B*K);
+estPoles = eig(kest.A);
+fprintf(['robotLQG_setup: l = %.4f m, r = %.4f m, Jc = %.5f kg m^2; stepper limits ' ...
+         'omegaMax %.1f rad/s (%.2f m/s), alphaMax %.1f rad/s^2 (%.2f m/s^2), ' ...
+         'A_p %.3f, lean at alphaMax %.0f deg\n'], robot.l, robot.r, robot.Jc, ...
+        omegaMax, omegaMax*robot.r, alphaMax, alphaMax*robot.r, lim.Ap, lim.thetaHold*180/pi);
+fprintf('robotLQG_setup: open-loop pole %.2f /s; ', robot.unstablePole());
+fprintf('closed loop |z| max %.4f, estimator |z| max %.4f (both must be < 1)\n', ...
+    max(abs(clPoles)), max(abs(estPoles)));
+fprintf('  K = [%s]  (phi, theta, ptheta, omega, integral)\n', sprintf(' %.3f', K));
+
+%% MPC (later)
+% With the Model Predictive Control Toolbox, the Control subsystem can be
+% replaced by an MPC Controller block built from the same discrete model:
+%   plantd = c2d(ss(A, B, C, D), Ts);
+%   mpcobj = mpc(plantd, Ts, 50, 10);                    % 0.1 s horizon, 10 moves
+%   mpcobj.MV.Min = -omegaMax;      mpcobj.MV.Max = omegaMax;
+%   mpcobj.MV.RateMin = -alphaMax*Ts; mpcobj.MV.RateMax = alphaMax*Ts;   % stepper limits
+%   (the same limits this LQR design builds in by designing on acceleration)
+%   mpcobj.Weights.OutputVariables = [1/phiTol, 1/thetaTol, 0];
+% MPC's default output disturbance model gives offset-free tracking, which
+% replaces the integrator here.
