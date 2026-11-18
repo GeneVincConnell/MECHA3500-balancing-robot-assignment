@@ -76,6 +76,11 @@ extern "C" {
 #define ENC_SIGN_L          (+1)
 #define ENC_SIGN_R          (-1)
 
+/* >>> AI-GENERATED START (Claude, 2026-11-18): wheel radius for Encoder_Distance_m() */
+/* Wheel radius, m. Keep the same as meas.r in robotLQG_setup_AIgen.m. */
+#define ENC_WHEEL_RADIUS_M  0.05624f
+/* <<< AI-GENERATED END */
+
 /* Wheel IDs, same numbering as TMC_LEFT / TMC_RIGHT in Robot.h */
 #define ENC_LEFT            0U
 #define ENC_RIGHT           1U
@@ -112,6 +117,17 @@ uint8_t Encoder_Init(float sample_period_s);
 
 /* Call exactly once per sample period, from the fixed-rate timer callback. */
 void Encoder_Update(void);
+
+/* >>> AI-GENERATED START (Claude, 2026-11-18): distance estimate for Robot_Foward_AIgen.c */
+/* Distance the robot has rolled since Encoder_Init(), metres, + = forwards:
+   wheel radius x the average of the two wheel angles. Subtract two readings
+   to get the distance between them. The encoders measure the wheels against
+   the chassis, so tilting the chassis 1 deg also reads as 1 mm. */
+float Encoder_Distance_m(void);
+
+/* Forward speed, m/s: wheel radius x the average PLL wheel speed */
+float Encoder_Speed_mps(void);
+/* <<< AI-GENERATED END */
 
 #ifdef __cplusplus
 }

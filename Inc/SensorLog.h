@@ -12,16 +12,19 @@
  * Updated by Claude, 14 Nov 2026: logFall command (pre/post-trigger capture
  * with both motors holding), 500 Hz sampling, gyro range +/-1000 deg/s,
  * #INFO line with the scale factors, read-error and timing-gap counts.
+ * Updated by Claude, 17 Nov 2026: serial through Lab5.c instead of a second
+ * USART2 driver in SensorLog.c (see "Serial" below).
  *
  * Put this file in Core/Inc and SensorLog.c in Core/Src.
  *
  * Serial: USART2 (PA2/PA3), the ST-LINK virtual COM port, 115200 8N1 as set
- * by CubeMX's MX_USART2_UART_Init(). SensorLog.c adds the interrupt driver
- * and defines USART2_IRQHandler() itself (USART2 global interrupt is off in
- * the .ioc). If you ever turn that interrupt on in CubeMX, or add Lab5.c
- * (which has its own USART2_IRQHandler), the build fails with "multiple
- * definition of USART2_IRQHandler": keep only one of them.
- * printf still goes to SWV as before; only SensorLog uses USART2.
+ * by CubeMX's MX_USART2_UART_Init(), driven by Lab5.c (the project's only
+ * USART2 driver, an adaptation of the course toolchain's uart.c and
+ * cmd_parser.c). logAll and logFall are entries in Lab5.c's command table,
+ * so "help" lists them with the Lab 5 commands, and SensorLog prints with
+ * Lab5_printf(). printf still goes to SWV as before.
+ * If you ever turn on "USART2 global interrupt" in CubeMX, the build fails
+ * with "multiple definition of USART2_IRQHandler": delete CubeMX's copy.
  *
  * ---------------------------------------------------------------------------
  * logAll [seconds]                      (default 3 s, at most SENSORLOG_MAX_S)
@@ -90,8 +93,12 @@
  *
  * main.c
  *   USER CODE BEGIN Includes:   #include "SensorLog.h"
- *   USER CODE BEGIN 2:          SensorLog_Init();     (after the IMU set-up)
+ *   USER CODE BEGIN 2:          Lab5_Init(); logging_init();  (serial first)
+ *                               SensorLog_Init();     (after the IMU set-up)
  *   while(1) loop, straight after IMU_Update():   SensorLog_Update();
+ *                               then Lab5_Process() only when
+ *                               SensorLog_Busy() is 0 (commands wait in the
+ *                               RX buffer while a run records or sends)
  *   and print with Data_Print() only when SensorLog_Busy() is 0.
  */
 #ifndef SENSORLOG_H
@@ -137,15 +144,20 @@ extern "C" {
 /* ========================================================================= */
 /* Functions                                                                 */
 /* ========================================================================= */
-/* Once, in USER CODE BEGIN 2 (after MX_USART2_UART_Init()): turns on the
-   USART2 receive interrupt and prints a ready line on the COM port. */
+/* Once, in USER CODE BEGIN 2, after Lab5_Init(): prints a ready line on
+   the COM port. */
 void    SensorLog_Init(void);
 
-/* Every main-loop pass, straight after IMU_Update(). Reads serial commands
-   when idle, takes a sample while recording, queues CSV lines while
-   sending. logAll and logFall run from here and block for ~1-1.5 s (motor
-   hold settling and gyro calibration). */
+/* Every main-loop pass, straight after IMU_Update(). Takes a sample while
+   recording, queues CSV lines while sending. */
 void    SensorLog_Update(void);
+
+/* The logAll and logFall commands, called by Lab5.c's command parser
+   (argv[0] is the command). They block for ~1-1.5 s (motor hold settling
+   and gyro calibration), stop any Lab 5 logPot / logEnc run, and refuse to
+   start while a SensorLog run is in progress. */
+void    SensorLog_CmdLogAll(int argc, char *argv[]);
+void    SensorLog_CmdLogFall(int argc, char *argv[]);
 
 /* 1 from logAll / logFall until the #CSV_END (or #ERROR) line has been queued */
 uint8_t SensorLog_Busy(void);

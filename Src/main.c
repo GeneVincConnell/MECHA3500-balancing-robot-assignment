@@ -23,6 +23,8 @@
 /* USER CODE BEGIN Includes */
 #include "Robot.h"
 #include "SensorLog.h"
+#include "Balance_AIgen.h"  /* AI-GENERATED (Claude, 2026-11-17) */
+#include "Robot_Foward_AIgen.h"  /* AI-GENERATED (Claude, 2026-11-18) */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -117,6 +119,15 @@ int main(void)
   /* USER CODE BEGIN 2 */
   /* The user code in this file was written with Claude (Anthropic, AI). */
 
+  /* Serial on the ST-LINK COM port (Lab5.c, the course toolchain's uart.c /
+     cmd_parser.c adapted for CubeIDE): USART2 interrupts, "Hello World!",
+     then the TIM6 tick for Lab 5's logPot / logEnc. Everything that uses the
+     COM port (SensorLog too) goes through Lab5.c, so this comes first.
+     CHANGE (Claude, 17 Nov 2026): added; SensorLog no longer has its own
+     USART2 driver. */
+  Lab5_Init();
+  logging_init();
+
   /* LD2 heartbeat: TIM2 CH1 hardware PWM, 0.5 s period (0.25 s on / 0.25 s off) */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 
@@ -144,13 +155,44 @@ int main(void)
   }
 
   /* Encoder + IMU logger on the ST-LINK COM port (SensorLog.c, written by
-     Claude, AI). Turns on the USART2 receive interrupt; from then on
-     MATLAB's logRobotSensors.m sends
+     Claude, AI). Its commands come through Lab5.c's command line; MATLAB's
+     logRobotSensors.m sends
        "logAll [seconds]"            stop the motor PWM, recalibrate the
                                      gyro, record, send the data as CSV
        "logFall [pre] [post] [deg]"  motors held, recalibrate, wait for the
                                      robot to fall, send the fall as CSV */
   SensorLog_Init();
+
+  /* >>> AI-GENERATED START (Claude, 2026-11-17, changed 2026-11-18): start the balance controller */
+  /* Balance_AIgen.c runs the MATLAB-generated controller (Subsystem1, in
+     MATLAB_firmware_subsystem).
+     Balance_Start(seconds): sets up both TMC2240s (battery on) and arms the
+     controller: hold the robot upright and still for 0.5 s and it starts
+     balancing. It then balances in place for that many seconds before going
+     on to the next line, and keeps balancing afterwards (in the while(1)
+     loop below). Balance_Start('N') balances forever and never returns.
+     The blue button B1 or "bal off" stops, B1 or "bal on" re-arms.
+     Details and the sign checks are in Balance_AIgen.h. */
+  Balance_Start(5.0f);                       // stand still 3 s
+  Robot_Foward(2.0f, 'N', 1.0f, 0.40f);   // drive 0.5 m (starts at once)
+  Balance_Start(5.0f);                       // waits for the move, then 2 s
+  Robot_Foward(-2.0f, 0.10f, 0.20f, 0.40f);  // and back
+  Balance_Start('N');                        // balance forever
+  /* <<< AI-GENERATED END */
+
+  /* >>> AI-GENERATED START (Claude, 2026-11-18): example moves, switched off */
+  /* Robot_Foward(distance (m), average velocity (m/s) or 'N',
+                  peak acceleration (m/s^2), acceleration gradient (m/s^3))
+     The robot is balancing by now, so a move starts at once. A
+     Balance_Start(seconds) after a move waits for it to finish, then
+     balances in place that long. Take the // off to use them.
+     The same from the serial port, while it balances:  fwd 0.5 0.1 0.2 0.4
+     Details are above the function in Robot_Foward_AIgen.c. */
+  // Robot_Foward(0.5f, 0.10f, 0.20f, 0.40f);    /* 0.5 m forwards in 5 s */
+  // Balance_Start(2.0f);                        /* stand still 2 s       */
+  // Robot_Foward(-0.5f, 0.10f, 0.20f, 0.40f);   /* and back              */
+  // Balance_Start('N');                         /* balance forever       */
+  /* <<< AI-GENERATED END */
 
   /* Configure the TMC2240s and start the motors, after the gyro calibration.
      TMC_EN (PB5) boots HIGH, so the drivers stay off until Motor_test(). */
@@ -174,9 +216,23 @@ int main(void)
     for (uint32_t i = 0; i < DATA_PRINT_SAMPLES; i++) {
       IMU_WaitForNextSample();
       IMU_Update();
+      /* >>> AI-GENERATED START (Claude, 2026-11-17): balance controller step */
+      /* Straight after IMU_Update(), so the controller sees this sample's tilt */
+      Balance_Update();
+      /* <<< AI-GENERATED END */
       SensorLog_Update();
+      /* Serial commands and Lab 5 log output (Lab5.c). Not while SensorLog
+         is recording or sending, so nothing lands in the middle of its CSV;
+         commands typed meanwhile wait in the RX buffer.
+         CHANGE (Claude, 17 Nov 2026): added with the move to Lab5.c. */
+      if (!SensorLog_Busy()) {
+        Lab5_Process();
+      }
     }
-    if (!SensorLog_Busy()) {
+    /* CHANGE (Claude, 17 Nov 2026): no line while the balance controller
+       drives the motors either. Data_Print()'s float printf (and SWV) can
+       take a large part of a 2 ms period; use "bal stream" instead. */
+    if (!SensorLog_Busy() && !Balance_Active()) {
       Data_Print();
     }
   }

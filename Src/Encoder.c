@@ -170,3 +170,26 @@ void Encoder_Update(void)
         e->velocity_rad_s     = e->pll_vel_counts_s * rad_per_count;
     }
 }
+
+/* >>> AI-GENERATED START (Claude, 2026-11-18): distance estimate for Robot_Foward_AIgen.c */
+/* Distance rolled since Encoder_Init(), metres, + = forwards (see Encoder.h).
+   Both counts are read with interrupts held off, so they come from the same
+   Encoder_Update(). Exact in a float up to 16 million counts (about 700 m). */
+float Encoder_Distance_m(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    int32_t left  = enc[ENC_LEFT].position;
+    int32_t right = enc[ENC_RIGHT].position;
+    __set_PRIMASK(primask);
+
+    return 0.5f * (float)(left + right) * rad_per_count * ENC_WHEEL_RADIUS_M;
+}
+
+/* Forward speed, m/s, from the PLL wheel speeds */
+float Encoder_Speed_mps(void)
+{
+    return 0.5f * (enc[ENC_LEFT].velocity_rad_s + enc[ENC_RIGHT].velocity_rad_s)
+           * ENC_WHEEL_RADIUS_M;
+}
+/* <<< AI-GENERATED END */

@@ -4,17 +4,22 @@
  *          MATLAB. See SensorLog.h.
  *
  * PROVENANCE: AI-generated. Written by Claude (Anthropic), 14 Nov 2026.
- * Nothing downloaded or copied. The USART2 interrupt driver follows the same
- * design as Claude's Lab5.c for this course (ring buffers, register level),
- * rewritten here so the robot firmware does not need Lab5.c. The hold
- * current is set with the TMC-API field functions (TMC2240.h, Analog
- * Devices), the same way Motor_test.c does.
+ * Nothing downloaded or copied. The hold current is set with the TMC-API
+ * field functions (TMC2240.h, Analog Devices), the same way Motor_test.c
+ * does.
  * Updated by Claude, 14 Nov 2026: logFall (pre/post-trigger capture with the
  * motors holding), #INFO line, read-error and timing-gap counts, negative
  * times before the trigger.
+ * Updated by Claude, 17 Nov 2026: serial goes through Lab5.c (Gene's
+ * adaptation of the MCHA3500 course toolchain) instead of this file's own
+ * USART2 driver, which is gone: output with Lab5_printf(), and logAll /
+ * logFall are entries in Lab5.c's command table (SensorLog_CmdLogAll(),
+ * SensorLog_CmdLogFall()). Lab5.c's command line, help and "unknown command"
+ * replace this file's copies.
  *
  * States
- *   IDLE        reads serial commands
+ *   IDLE        waiting: Lab5_Process() runs logAll / logFall when they
+ *               arrive on the serial port
  *   ARMED       logAll / logFall has calibrated the gyro; the next
  *               SensorLog_Update() takes the first sample
  *   RECORDING   logAll: one sample per SensorLog_Update() until [seconds] is
@@ -29,7 +34,6 @@
                             Motor_*(), tmc_ok[], TMC2240.h (TMC-API) */
 #include "SensorLog.h"
 #include <math.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,17 +41,11 @@
 /* ========================================================================= */
 /* Private settings                                                          */
 /* ========================================================================= */
-#define SL_TX_BUF_SIZE      2048U    /* bytes, power of 2                     */
-#define SL_RX_BUF_SIZE      64U      /* bytes, power of 2                     */
-#define SL_LINE_MAX         200U     /* longest line sl_printf() sends        */
-#define SL_CMD_MAX          32U      /* longest command line, incl. '\0'      */
-#define SL_CMD_MAX_ARGS     4U
 #define SL_ACC_LSB_PER_G    16384U   /* +/-2 g, the library's setting         */
 
-/* NVIC_PRIORITYGROUP_0 (stm32f4xx_hal_msp.c): no pre-emption, so USART2
-   never interrupts SysTick's Encoder_Update(); this only sets the order
-   when both are pending. SysTick is 0. */
-#define SL_USART2_SUBPRIORITY  2U
+/* A CSV row is queued only when Lab5.c's TX buffer has room for the longest
+   line Lab5_printf() can send, so queuing never waits */
+#define SL_LINE_ROOM        LAB5_PRINTF_MAX
 
 #define SL_CSV_HEADER   "time_s,enc_L_counts,enc_R_counts," \
                         "acc_x_raw,acc_y_raw,acc_z_raw,"    \
@@ -118,104 +116,6 @@ static uint32_t          sl_max_gap_us;
 /* Motor hold (logFall) */
 static uint8_t           sl_hold_active;          /* IHOLD raised, drivers on   */
 static uint8_t           sl_hold_restore_disable; /* drivers were off before    */
-
-/* ========================================================================= */
-/* Serial: USART2 interrupt driver                                           */
-/* ========================================================================= */
-/* Ring buffers. Each index has one writer, so no locking is needed: main
-   writes sl_tx_head and sl_rx_tail, the interrupt writes sl_tx_tail and
-   sl_rx_head. */
-static volatile uint8_t  sl_tx_buf[SL_TX_BUF_SIZE];
-static volatile uint16_t sl_tx_head = 0U;
-static volatile uint16_t sl_tx_tail = 0U;
-static volatile uint8_t  sl_rx_buf[SL_RX_BUF_SIZE];
-static volatile uint16_t sl_rx_head = 0U;
-static volatile uint16_t sl_rx_tail = 0U;
-
-/* Free bytes in the TX buffer (one slot is always kept empty) */
-static uint16_t sl_tx_free(void)
-{
-    return (uint16_t)((sl_tx_tail - sl_tx_head - 1U) & (SL_TX_BUF_SIZE - 1U));
-}
-
-/* Queue one character. If the buffer is full, wait for the interrupt to
-   send some (main context only). */
-static void sl_putc(char c)
-{
-    uint16_t next = (uint16_t)((sl_tx_head + 1U) & (SL_TX_BUF_SIZE - 1U));
-    while (next == sl_tx_tail) {
-        ATOMIC_SET_BIT(USART2->CR1, USART_CR1_TXEIE);
-    }
-    sl_tx_buf[sl_tx_head] = (uint8_t)c;
-    sl_tx_head = next;
-}
-
-/* printf to the ST-LINK COM port. Main context only. Lines longer than
-   SL_LINE_MAX - 1 characters are cut short. */
-static int sl_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static int sl_printf(const char *fmt, ...)
-{
-    char    buf[SL_LINE_MAX];
-    va_list ap;
-
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n < 0) {
-        return n;
-    }
-
-    size_t len = ((size_t)n < sizeof(buf)) ? (size_t)n : (sizeof(buf) - 1U);
-    for (size_t i = 0; i < len; i++) {
-        sl_putc(buf[i]);
-    }
-    /* TXE interrupt on. ATOMIC_SET_BIT (CMSIS) because the interrupt clears
-       TXEIE in the same register. */
-    ATOMIC_SET_BIT(USART2->CR1, USART_CR1_TXEIE);
-    return (int)len;
-}
-
-/* Next received character, or -1 if none is waiting */
-static int sl_getchar(void)
-{
-    if (sl_rx_tail == sl_rx_head) {
-        return -1;
-    }
-    uint8_t c = sl_rx_buf[sl_rx_tail];
-    sl_rx_tail = (uint16_t)((sl_rx_tail + 1U) & (SL_RX_BUF_SIZE - 1U));
-    return (int)c;
-}
-
-/* USART2 interrupt. Not generated by CubeMX (USART2 global interrupt is off
-   in the .ioc), so it is defined here. */
-void USART2_IRQHandler(void)
-{
-    uint32_t sr = USART2->SR;
-
-    /* Receive. Reading SR then DR also clears the error flags (ORE, NE, FE,
-       PE), so an overrun or framing error cannot leave the interrupt stuck. */
-    if (sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) {
-        uint8_t c = (uint8_t)USART2->DR;
-        if ((sr & USART_SR_RXNE) && !(sr & (USART_SR_NE | USART_SR_FE | USART_SR_PE))) {
-            uint16_t next = (uint16_t)((sl_rx_head + 1U) & (SL_RX_BUF_SIZE - 1U));
-            if (next != sl_rx_tail) {             /* full: drop the character */
-                sl_rx_buf[sl_rx_head] = c;
-                sl_rx_head = next;
-            }
-        }
-    }
-
-    /* Transmit the next queued character, or stop the TXE interrupt when the
-       buffer is empty */
-    if ((USART2->CR1 & USART_CR1_TXEIE) && (sr & USART_SR_TXE)) {
-        if (sl_tx_tail != sl_tx_head) {
-            USART2->DR = sl_tx_buf[sl_tx_tail];
-            sl_tx_tail = (uint16_t)((sl_tx_tail + 1U) & (SL_TX_BUF_SIZE - 1U));
-        } else {
-            USART2->CR1 &= ~USART_CR1_TXEIE;
-        }
-    }
-}
 
 /* ========================================================================= */
 /* Motors                                                                    */
@@ -391,9 +291,9 @@ static void sl_take_sample(void)
     case SL_FALL_WAIT:
         if (t_us >= sl_timeout_us) {
             sl_motor_hold_off();
-            sl_printf("#ERROR logFall: no fall within %.0f s (the tilt never moved %.1f deg "
-                      "from where it was at arming); motors are back as they were\n",
-                      (double)SENSORLOG_FALL_TIMEOUT_S, (double)(sl_trigger_rad * RAD_TO_DEG));
+            Lab5_printf("#ERROR logFall: no fall within %.0f s (the tilt never moved %.1f deg "
+                        "from where it was at arming); motors are back as they were\n",
+                        (double)SENSORLOG_FALL_TIMEOUT_S, (double)(sl_trigger_rad * RAD_TO_DEG));
             sl_state = SL_IDLE;
             return;
         }
@@ -443,8 +343,8 @@ static void sl_take_sample(void)
         sl_first     = first;
         sl_trig_t_us = t_us;
         sl_state     = SL_FALL_POST;
-        sl_printf("SensorLog: fall detected, recording %.1f s more\n",
-                  (double)sl_post_us * 1e-6);
+        Lab5_printf("SensorLog: fall detected, recording %.1f s more\n",
+                    (double)sl_post_us * 1e-6);
     }
 }
 
@@ -453,29 +353,29 @@ static void sl_take_sample(void)
 /* ========================================================================= */
 static void sl_send(void)
 {
-    while ((sl_state >= SL_SEND_INFO) && (sl_tx_free() >= SL_LINE_MAX)) {
+    while ((sl_state >= SL_SEND_INFO) && (Lab5_TxFree() >= SL_LINE_ROOM)) {
         switch (sl_state) {
         case SL_SEND_INFO:
             /* Run settings and scale factors, for MATLAB */
-            sl_printf("#INFO fall=%u pre_s=%.3f post_s=%.3f trigger_deg=%.2f sample_period_us=%lu "
-                      "gyro_lsb_per_dps=%.1f acc_lsb_per_g=%lu\n",
-                      (unsigned)sl_fall,
-                      sl_fall ? (double)sl_pre_us * 1e-6 : 0.0,
-                      sl_fall ? (double)sl_post_us * 1e-6 : (double)sl_duration_us * 1e-6,
-                      sl_fall ? (double)(sl_trigger_rad * RAD_TO_DEG) : 0.0,
-                      (unsigned long)IMU_SAMPLE_US,
-                      (double)imu_data.gyro_lsb_per_dps,
-                      (unsigned long)SL_ACC_LSB_PER_G);
+            Lab5_printf("#INFO fall=%u pre_s=%.3f post_s=%.3f trigger_deg=%.2f sample_period_us=%lu "
+                        "gyro_lsb_per_dps=%.1f acc_lsb_per_g=%lu\n",
+                        (unsigned)sl_fall,
+                        sl_fall ? (double)sl_pre_us * 1e-6 : 0.0,
+                        sl_fall ? (double)sl_post_us * 1e-6 : (double)sl_duration_us * 1e-6,
+                        sl_fall ? (double)(sl_trigger_rad * RAD_TO_DEG) : 0.0,
+                        (unsigned long)IMU_SAMPLE_US,
+                        (double)imu_data.gyro_lsb_per_dps,
+                        (unsigned long)SL_ACC_LSB_PER_G);
             sl_state = SL_SEND_BEGIN;
             break;
 
         case SL_SEND_BEGIN:
-            sl_printf("#CSV_BEGIN\n");
+            Lab5_printf("#CSV_BEGIN\n");
             sl_state = SL_SEND_HEADER;
             break;
 
         case SL_SEND_HEADER:
-            sl_printf(SL_CSV_HEADER "\n");
+            Lab5_printf(SL_CSV_HEADER "\n");
             sl_state = (sl_nsend > 0U) ? SL_SEND_ROWS : SL_SEND_END;
             break;
 
@@ -489,14 +389,14 @@ static void sl_send(void)
             /* Time relative to the first sample (logAll) or the trigger (logFall) */
             int32_t  t_rel = (int32_t)(s->t_us - sl_t_ref_us);
             uint32_t t_mag = (t_rel < 0) ? (uint32_t)(-t_rel) : (uint32_t)t_rel;
-            sl_printf("%s%lu.%06lu,%ld,%ld,%d,%d,%d,%d,%d,%d,%.5f,%.5f\n",
-                      (t_rel < 0) ? "-" : "",
-                      (unsigned long)(t_mag / 1000000U),
-                      (unsigned long)(t_mag % 1000000U),
-                      (long)(s->enc_L - sl_enc0_L), (long)(s->enc_R - sl_enc0_R),
-                      s->acc[0], s->acc[1], s->acc[2],
-                      s->gyro[0], s->gyro[1], s->gyro[2],
-                      (double)s->theta, (double)s->theta_dot);
+            Lab5_printf("%s%lu.%06lu,%ld,%ld,%d,%d,%d,%d,%d,%d,%.5f,%.5f\n",
+                        (t_rel < 0) ? "-" : "",
+                        (unsigned long)(t_mag / 1000000U),
+                        (unsigned long)(t_mag % 1000000U),
+                        (long)(s->enc_L - sl_enc0_L), (long)(s->enc_R - sl_enc0_R),
+                        s->acc[0], s->acc[1], s->acc[2],
+                        s->gyro[0], s->gyro[1], s->gyro[2],
+                        (double)s->theta, (double)s->theta_dot);
             if (++sl_sent >= sl_nsend) {
                 sl_state = SL_SEND_END;
             }
@@ -511,13 +411,13 @@ static void sl_send(void)
                 span_s = (double)(t1 - t0) * 1e-6;
             }
             double rate = (span_s > 0.0) ? (double)(sl_nsend - 1U) / span_s : 0.0;
-            sl_printf("#CSV_END samples=%lu duration_s=%.3f rate_Hz=%.1f max_gap_ms=%.2f "
-                      "buffer_full=%u pwm_restarted=%lu i2c_errors=%lu gyro_bias_x_dps=%.3f "
-                      "theta_arm_rad=%.5f\n",
-                      (unsigned long)sl_nsend, span_s, rate, (double)sl_max_gap_us * 1e-3,
-                      (unsigned)sl_buffer_full, (unsigned long)sl_pwm_restarted,
-                      (unsigned long)sl_i2c_errors_run, (double)sl_gyro_bias_dps,
-                      (double)sl_theta_arm);
+            Lab5_printf("#CSV_END samples=%lu duration_s=%.3f rate_Hz=%.1f max_gap_ms=%.2f "
+                        "buffer_full=%u pwm_restarted=%lu i2c_errors=%lu gyro_bias_x_dps=%.3f "
+                        "theta_arm_rad=%.5f\n",
+                        (unsigned long)sl_nsend, span_s, rate, (double)sl_max_gap_us * 1e-3,
+                        (unsigned)sl_buffer_full, (unsigned long)sl_pwm_restarted,
+                        (unsigned long)sl_i2c_errors_run, (double)sl_gyro_bias_dps,
+                        (double)sl_theta_arm);
             sl_state = SL_IDLE;
             break;
         }
@@ -532,14 +432,30 @@ static void sl_send(void)
 /* ========================================================================= */
 /* Commands                                                                  */
 /* ========================================================================= */
-/* logAll [seconds] */
-static void sl_cmd_logAll(int argc, char *argv[])
+/* Lab 5's logPot / logEnc print from Lab5_Process(); stop them so their
+   lines cannot land in the middle of the CSV. Returns 0 (and says why) if a
+   SensorLog run is already going. */
+static uint8_t sl_can_start(const char *cmd)
 {
+    if (SensorLog_Busy()) {
+        Lab5_printf("#ERROR %s: a SensorLog run is already in progress\n", cmd);
+        return 0U;
+    }
+    logging_stop();
+    return 1U;
+}
+
+/* logAll [seconds]. Called by Lab5.c's command parser. */
+void SensorLog_CmdLogAll(int argc, char *argv[])
+{
+    if (!sl_can_start("logAll")) {
+        return;
+    }
     float seconds = SENSORLOG_DEFAULT_S;
     if (argc >= 2) {
         seconds = (float)atof(argv[1]);
         if (!((seconds >= 0.1f) && (seconds <= SENSORLOG_MAX_S))) {
-            sl_printf("#ERROR logAll: seconds must be 0.1 to %.1f\n", (double)SENSORLOG_MAX_S);
+            Lab5_printf("#ERROR logAll: seconds must be 0.1 to %.1f\n", (double)SENSORLOG_MAX_S);
             return;
         }
     }
@@ -551,9 +467,9 @@ static void sl_cmd_logAll(int argc, char *argv[])
 #endif
 
     /* 2. Gyro bias, robot still. Blocks the main loop for ~1 s. */
-    sl_printf("SensorLog: motor PWM off. Keep the robot still: calibrating the gyro\n");
+    Lab5_printf("SensorLog: motor PWM off. Keep the robot still: calibrating the gyro\n");
     if (!sl_calibrate_imu()) {
-        sl_printf("#ERROR SensorLog: the MPU-6050 is not answering (imu_ok = 0), nothing logged\n");
+        Lab5_printf("#ERROR SensorLog: the MPU-6050 is not answering (imu_ok = 0), nothing logged\n");
         return;
     }
     sl_gyro_bias_dps = imu_data.gyro_bias_x;
@@ -562,13 +478,16 @@ static void sl_cmd_logAll(int argc, char *argv[])
     sl_duration_us = (uint32_t)((seconds * 1.0e6f) + 0.5f);
     sl_arm(0U);
 
-    sl_printf("SensorLog: gyro bias x = %.3f deg/s. Recording %.1f s\n",
-              (double)sl_gyro_bias_dps, (double)seconds);
+    Lab5_printf("SensorLog: gyro bias x = %.3f deg/s. Recording %.1f s\n",
+                (double)sl_gyro_bias_dps, (double)seconds);
 }
 
-/* logFall [pre_s] [post_s] [trigger_deg] */
-static void sl_cmd_logFall(int argc, char *argv[])
+/* logFall [pre_s] [post_s] [trigger_deg]. Called by Lab5.c's command parser. */
+void SensorLog_CmdLogFall(int argc, char *argv[])
 {
+    if (!sl_can_start("logFall")) {
+        return;
+    }
     float pre  = SENSORLOG_FALL_PRE_S;
     float post = SENSORLOG_FALL_POST_S;
     float trig = SENSORLOG_FALL_TRIGGER_DEG;
@@ -576,32 +495,32 @@ static void sl_cmd_logFall(int argc, char *argv[])
     if (argc >= 3) { post = (float)atof(argv[2]); }
     if (argc >= 4) { trig = (float)atof(argv[3]); }
     if (!((pre >= 0.0f) && (post >= 0.1f) && ((pre + post) <= SENSORLOG_MAX_S))) {
-        sl_printf("#ERROR logFall: need pre_s >= 0, post_s >= 0.1 and pre_s + post_s <= %.1f\n",
-                  (double)SENSORLOG_MAX_S);
+        Lab5_printf("#ERROR logFall: need pre_s >= 0, post_s >= 0.1 and pre_s + post_s <= %.1f\n",
+                    (double)SENSORLOG_MAX_S);
         return;
     }
     if (!((trig >= 0.5f) && (trig <= 20.0f))) {
-        sl_printf("#ERROR logFall: trigger_deg must be 0.5 to 20\n");
+        Lab5_printf("#ERROR logFall: trigger_deg must be 0.5 to 20\n");
         return;
     }
 
     /* 1. STEP PWM off, both motors holding at the run current */
     sl_motor_pwm_off();
-    sl_printf("SensorLog: motor PWM off. Hold the robot upright: enabling both motors to hold\n");
+    Lab5_printf("SensorLog: motor PWM off. Hold the robot upright: enabling both motors to hold\n");
     if (!sl_motor_hold_on()) {
         sl_motor_hold_off();
-        sl_printf("#ERROR logFall: a TMC2240 did not answer or did not take the hold current "
-                  "(tmc_ok L %u R %u, version L 0x%02X R 0x%02X). Is the battery on?\n",
-                  (unsigned)tmc_ok[TMC_LEFT], (unsigned)tmc_ok[TMC_RIGHT],
-                  (unsigned)tmc_version[TMC_LEFT], (unsigned)tmc_version[TMC_RIGHT]);
+        Lab5_printf("#ERROR logFall: a TMC2240 did not answer or did not take the hold current "
+                    "(tmc_ok L %u R %u, version L 0x%02X R 0x%02X). Is the battery on?\n",
+                    (unsigned)tmc_ok[TMC_LEFT], (unsigned)tmc_ok[TMC_RIGHT],
+                    (unsigned)tmc_version[TMC_LEFT], (unsigned)tmc_version[TMC_RIGHT]);
         return;
     }
 
     /* 2. Gyro bias, robot held still. Blocks the main loop for ~1 s. */
-    sl_printf("SensorLog: motors holding. Keep the robot upright and STILL: calibrating the gyro\n");
+    Lab5_printf("SensorLog: motors holding. Keep the robot upright and STILL: calibrating the gyro\n");
     if (!sl_calibrate_imu()) {
         sl_motor_hold_off();
-        sl_printf("#ERROR SensorLog: the MPU-6050 is not answering (imu_ok = 0), nothing logged\n");
+        Lab5_printf("#ERROR SensorLog: the MPU-6050 is not answering (imu_ok = 0), nothing logged\n");
         return;
     }
     sl_gyro_bias_dps = imu_data.gyro_bias_x;
@@ -613,80 +532,9 @@ static void sl_cmd_logFall(int argc, char *argv[])
     sl_timeout_us  = (uint32_t)(SENSORLOG_FALL_TIMEOUT_S * 1.0e6f);
     sl_arm(1U);
 
-    sl_printf("SensorLog: gyro bias x = %.3f deg/s. Armed: let go of the robot "
-              "(trigger %.1f deg, %.0f s to fall)\n",
-              (double)sl_gyro_bias_dps, (double)trig, (double)SENSORLOG_FALL_TIMEOUT_S);
-}
-
-/* Split a line into words and run the command. Nothing is echoed back. */
-static void sl_run_line(char *line)
-{
-    char *argv[SL_CMD_MAX_ARGS + 1U];
-    int   argc = 0;
-
-    for (char *p = line; (*p != '\0') && (argc < (int)SL_CMD_MAX_ARGS); ) {
-        while ((*p == ' ') || (*p == '\t')) {
-            p++;
-        }
-        if (*p == '\0') {
-            break;
-        }
-        argv[argc++] = p;
-        while ((*p != '\0') && (*p != ' ') && (*p != '\t')) {
-            p++;
-        }
-        if (*p != '\0') {
-            *p++ = '\0';
-        }
-    }
-    argv[argc] = NULL;
-
-    if (argc == 0) {
-        return;
-    }
-    if (strcmp(argv[0], "logAll") == 0) {
-        sl_cmd_logAll(argc, argv);
-    } else if (strcmp(argv[0], "logFall") == 0) {
-        sl_cmd_logFall(argc, argv);
-    } else if (strcmp(argv[0], "help") == 0) {
-        sl_printf("SensorLog commands:\n");
-        sl_printf("  logAll [seconds]  motor PWM off, calibrate gyro, record, send CSV\n");
-        sl_printf("  logFall [pre_s] [post_s] [trigger_deg]  motors hold, calibrate gyro,\n");
-        sl_printf("      wait for the tilt to move trigger_deg, send pre_s..post_s as CSV\n");
-    } else {
-        sl_printf("#ERROR unknown command \"%s\" (try help)\n", argv[0]);
-    }
-}
-
-/* Collect received characters into a line; a line ends at '\r' or '\n', so
-   MATLAB's writeline (LF), CoolTerm (CR+LF) and other terminals all work. */
-static void sl_rx_process(void)
-{
-    static char     line[SL_CMD_MAX];
-    static uint16_t len      = 0U;
-    static uint8_t  overflow = 0U;
-    int c;
-
-    while ((sl_state == SL_IDLE) && ((c = sl_getchar()) >= 0)) {
-        if ((c == '\r') || (c == '\n')) {
-            if (overflow) {
-                sl_printf("#ERROR command too long\n");
-            } else if (len > 0U) {
-                line[len] = '\0';
-                sl_run_line(line);
-            }
-            len      = 0U;
-            overflow = 0U;
-        } else if ((c == '\b') || (c == 0x7F)) {
-            if (len > 0U) {
-                len--;
-            }
-        } else if (len < (SL_CMD_MAX - 1U)) {
-            line[len++] = (char)c;
-        } else {
-            overflow = 1U;
-        }
-    }
+    Lab5_printf("SensorLog: gyro bias x = %.3f deg/s. Armed: let go of the robot "
+                "(trigger %.1f deg, %.0f s to fall)\n",
+                (double)sl_gyro_bias_dps, (double)trig, (double)SENSORLOG_FALL_TIMEOUT_S);
 }
 
 /* ========================================================================= */
@@ -694,23 +542,15 @@ static void sl_rx_process(void)
 /* ========================================================================= */
 void SensorLog_Init(void)
 {
-    /* MX_USART2_UART_Init() has set 115200 8N1 with TX and RX on. Throw away
-       anything received before now, then turn on the receive interrupt. */
-    (void)USART2->SR;
-    (void)USART2->DR;
-    ATOMIC_SET_BIT(USART2->CR1, USART_CR1_RXNEIE);
-    HAL_NVIC_SetPriority(USART2_IRQn, 0U, SL_USART2_SUBPRIORITY);
-    HAL_NVIC_EnableIRQ(USART2_IRQn);
-
-    sl_printf("SensorLog ready: send logAll [seconds] or logFall [pre_s] [post_s] [trigger_deg]\n");
+    /* The serial port is Lab5.c's: Lab5_Init() must have run first */
+    Lab5_printf("SensorLog ready: send logAll [seconds] or logFall [pre_s] [post_s] [trigger_deg]\n");
 }
 
 void SensorLog_Update(void)
 {
     switch (sl_state) {
     case SL_IDLE:
-        sl_rx_process();
-        break;
+        break;                                        /* commands come via Lab5_Process() */
     case SL_ARMED:
     case SL_RECORDING:
     case SL_FALL_WAIT:
