@@ -63,6 +63,12 @@
  *     wheels turn forwards slowly for 1 s, and it reports each wheel.
  *     (wrong: flip BAL_MOTOR_SIGN_L / BAL_MOTOR_SIGN_R below)
  *
+ * SWV (added 18 Nov 2026): while the motors are driven, Balance_Update()
+ * calls Balance_PrintData() every loop, which prints a CSV line to the SWV
+ * ITM Data Console every BAL_SWV_EVERY loops (100 lines/s), after a header:
+ *   #SWV t_ms,theta_deg,theta_dot_dps,velL_rad_s,velR_rad_s,phi_rad,phi_ref_rad,omega_cmd_rad_s
+ * When it is not balancing, main.c's Data_Print() lines come back as before.
+ *
  * Serial command (Lab5.c's table): bal [on|off|sign|stream Hz]
  *   bal              status: state, last stop reason, measurements, estimate
  *   bal on / off     arm / stop (same as the B1 button)
@@ -145,6 +151,18 @@ extern "C" {
 
 #define BAL_STREAM_MAX_HZ       50U       /* a line is ~100 characters        */
 
+/* SWV while balancing (Balance_PrintData()). main.c's Data_Print() is off
+   while the motors are driven: its 120-character float printf takes ~1.7 ms
+   of the 2 ms loop. This line is ~50 characters, formatted with integers,
+   queued and sent a little each loop, so it never delays the controller.
+   SWO sends about one character every 10 us (2 MHz SWO clock):
+     BAL_SWV_EVERY 5   100 lines/s, ~0.1 ms of each loop on average
+     BAL_SWV_EVERY 1   every loop: ~0.5 ms of each loop, and lines that do
+                       not fit in BAL_SWV_BUDGET_US are dropped (counted in
+                       bal.swv_dropped) instead of making the loop late */
+#define BAL_SWV_EVERY           5U        /* a line every N 2 ms loops         */
+#define BAL_SWV_BUDGET_US       400U      /* most time per loop spent sending  */
+
 /* ========================================================================= */
 /* State, for Live Expressions (add "bal")                                   */
 /* ========================================================================= */
@@ -179,8 +197,11 @@ typedef struct {
     uint32_t run_samples;        /* samples since engage (x 2 ms)             */
     uint32_t engage_count;       /* times it has engaged since reset          */
     uint32_t late_samples;       /* main loop overran 2 ms while running      */
-    float    exec_us;            /* Balance_Update() time, last sample        */
+    float    exec_us;            /* Balance_Update() time, last sample
+                                    (control only, not the SWV printing)      */
     float    exec_us_max;        /* ... worst since engage                    */
+    float    swv_us;             /* time spent sending SWV this loop          */
+    uint32_t swv_dropped;        /* SWV lines dropped: no room in the queue   */
 } Bal_Status;
 
 extern Bal_Status bal;
@@ -193,6 +214,8 @@ void    Balance_Start(float seconds);  /* arm, then balance in place this long
 void    Balance_Stop(void);      /* motors off now, state BAL_OFF             */
 void    Balance_Update(void);    /* every 2 ms, straight after IMU_Update()   */
 uint8_t Balance_Active(void);    /* 1 while the motors are driven             */
+void    Balance_PrintData(void); /* SWV line while balancing; called by
+                                    Balance_Update() every loop              */
 void    Balance_Cmd(int argc, char *argv[]);   /* "bal" (Lab5.c's command table) */
 
 #ifdef __cplusplus

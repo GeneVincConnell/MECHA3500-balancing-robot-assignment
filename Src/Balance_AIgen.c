@@ -40,6 +40,11 @@
  * Updated by Claude, 18 Nov 2026 (later): Balance_Start(seconds) balances in
  * place for that long before main.c carries on ('N' = forever). Arming
  * without waiting, for B1 and "bal on", is now bal_arm().
+ * Updated by Claude, 18 Nov 2026 (later still): Balance_PrintData() keeps SWV
+ * lines coming while the robot balances, without delaying the controller.
+ * It writes to ITM stimulus port 0 through the CMSIS register definitions
+ * already in the project (Drivers/CMSIS/Include/core_cm4.h, Arm, Apache-2.0),
+ * the same port data.c's printf uses.
  *
  * Feedforward for moves. The generated controller only has a position
  * reference:
@@ -354,6 +359,7 @@ static void bal_engage(void)
     bal.slip = 0.0f;
     bal.run_samples = 0U;
     bal.late_samples = 0U;
+    bal.swv_dropped = 0U;
     bal.exec_us_max = 0.0f;
     bal.engage_count++;
     missed_last = imu_data.missed_periods;
@@ -750,6 +756,102 @@ void Balance_Stop(void)
     }
 }
 
+/* ========================================================================= */
+/* SWV printing while balancing                                              */
+/* ========================================================================= */
+/* Lines are queued here and sent to ITM stimulus port 0 a few characters at
+   a time, never waiting longer than BAL_SWV_BUDGET_US per loop. CMSIS's
+   ITM_SendChar() (used by printf) waits for every character instead. */
+#define BAL_SWV_QUEUE   1024U                       /* bytes, power of 2  */
+static char     swv_q[BAL_SWV_QUEUE];
+static uint16_t swv_head, swv_tail;
+static uint32_t swv_count;
+static uint8_t  swv_header_sent;
+
+/* SWV is running: the debugger has enabled ITM and stimulus port 0 */
+static uint8_t bal_swv_enabled(void)
+{
+    return (((ITM->TCR & ITM_TCR_ITMENA_Msk) != 0UL) && ((ITM->TER & 1UL) != 0UL)) ? 1U : 0U;
+}
+
+/* Queue a whole line, or drop it if it does not fit */
+static void bal_swv_queue(const char *line)
+{
+    uint16_t len  = (uint16_t)strlen(line);
+    uint16_t room = (uint16_t)((swv_tail - swv_head - 1U) & (BAL_SWV_QUEUE - 1U));
+    if (len > room) {
+        bal.swv_dropped++;
+        return;
+    }
+    for (uint16_t i = 0U; i < len; i++) {
+        swv_q[swv_head] = line[i];
+        swv_head = (uint16_t)((swv_head + 1U) & (BAL_SWV_QUEUE - 1U));
+    }
+}
+
+/* Send queued characters for up to budget_us */
+static void bal_swv_send(uint32_t budget_us)
+{
+    uint32_t t0     = DWT->CYCCNT;
+    uint32_t cycles = budget_us * (SystemCoreClock / 1000000U);
+    while ((swv_tail != swv_head) && ((DWT->CYCCNT - t0) < cycles)) {
+        if (ITM->PORT[0U].u32 != 0UL) {            /* FIFO has room */
+            ITM->PORT[0U].u8 = (uint8_t)swv_q[swv_tail];
+            swv_tail = (uint16_t)((swv_tail + 1U) & (BAL_SWV_QUEUE - 1U));
+        }
+    }
+    bal.swv_us = (float)(DWT->CYCCNT - t0) / ((float)SystemCoreClock * 1.0e-6f);
+}
+
+/*
+ * Balance_PrintData()   called by Balance_Update() every 2 ms loop
+ *
+ * While the motors are driven: a CSV line to the SWV ITM Data Console every
+ * BAL_SWV_EVERY loops, header first:
+ *   t_ms, theta (deg), theta_dot (deg/s), wheel velocity L and R (rad/s,
+ *   Encoder.c), phi (rad), phi_ref (rad), commanded wheel speed (rad/s)
+ * Otherwise it only finishes sending what is left (motors off, so it can
+ * take its time), and main.c's Data_Print() takes over again.
+ */
+void Balance_PrintData(void)
+{
+    if (!bal_swv_enabled()) {
+        swv_head = swv_tail;                         /* no SWV: nothing to do */
+        swv_header_sent = 0U;
+        return;
+    }
+    if (!Balance_Active()) {
+        swv_header_sent = 0U;
+        if (swv_tail != swv_head) {
+            bal_swv_send(20000U);                    /* at most 20 ms, motors off */
+        }
+        return;
+    }
+
+    if (!swv_header_sent) {
+        bal_swv_queue("#SWV t_ms,theta_deg,theta_dot_dps,velL_rad_s,velR_rad_s,"
+                      "phi_rad,phi_ref_rad,omega_cmd_rad_s\n");
+        swv_header_sent = 1U;
+        swv_count = BAL_SWV_EVERY;                   /* a line straight away */
+    }
+    if (++swv_count >= BAL_SWV_EVERY) {
+        swv_count = 0U;
+        char line[96];
+        char *p = line + snprintf(line, 16, "%lu", (unsigned long)HAL_GetTick());
+        p = bal_put_fixed(p, bal.theta * RAD_TO_DEG,     2U);
+        p = bal_put_fixed(p, bal.theta_dot * RAD_TO_DEG, 1U);
+        p = bal_put_fixed(p, enc[ENC_LEFT].velocity_rad_s,  2U);
+        p = bal_put_fixed(p, enc[ENC_RIGHT].velocity_rad_s, 2U);
+        p = bal_put_fixed(p, bal.phi,     3U);
+        p = bal_put_fixed(p, bal.phi_ref, 3U);
+        p = bal_put_fixed(p, bal.omega,   2U);
+        *p++ = '\n';
+        *p   = '\0';
+        bal_swv_queue(line);
+    }
+    bal_swv_send(BAL_SWV_BUDGET_US);
+}
+
 uint8_t Balance_Active(void)
 {
     return ((bal.state == BAL_RUNNING) || (bal.state == BAL_SIGN_TEST)) ? 1U : 0U;
@@ -806,6 +908,9 @@ void Balance_Update(void)
     if ((bal.state == BAL_RUNNING) && (us > bal.exec_us_max)) {
         bal.exec_us_max = us;
     }
+
+    /* SWV line, every loop (it decides how often to print) */
+    Balance_PrintData();
 }
 
 /* ========================================================================= */
@@ -829,6 +934,8 @@ static void bal_print_status(void)
                 (double)bal.exec_us, (double)bal.exec_us_max,
                 (unsigned long)imu_data.i2c_errors,
                 (unsigned)tmc_ok[TMC_LEFT], (unsigned)tmc_ok[TMC_RIGHT]);
+    Lab5_printf("  SWV: %.0f us sending last loop, %lu lines dropped\n",
+                (double)bal.swv_us, (unsigned long)bal.swv_dropped);
 }
 
 void Balance_Cmd(int argc, char *argv[])
